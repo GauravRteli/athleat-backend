@@ -1,4 +1,41 @@
 const { query } = require("../config/postgres");
+const MISSION_IDS = ["m1", "m2", "m3", "m4", "m5"];
+
+function isValidMissionId(missionId) {
+  return MISSION_IDS.includes(missionId);
+}
+
+function isMissionUnlocked(missionsById, missionId) {
+  if (missionId === "m1") return true;
+  const idx = MISSION_IDS.indexOf(missionId);
+  if (idx <= 0) return false;
+  const prevId = MISSION_IDS[idx - 1];
+  return missionsById[prevId]?.status === "submitted";
+}
+
+function countVersionPics(versionData) {
+  if (!versionData || typeof versionData !== "object") return 0;
+  return Object.values(versionData).filter((item) => {
+    if (!item || typeof item !== "object") return false;
+    return Boolean(item.url || item.localUrl);
+  }).length;
+}
+
+function shapeMissionRow(row) {
+  return {
+    id: row.id,
+    missionId: row.mission_id,
+    status: row.status || "not_started",
+    v1: row.v1 || null,
+    v2: row.v2 || null,
+    v3: row.v3 || null,
+    submittedAt: row.submitted_at,
+    v2SubmittedAt: row.v2_submitted_at,
+    kerryFeedback: row.kerry_feedback || "",
+    feedbackStatus: row.feedback_status || "none",
+    feedbackApprovedAt: row.feedback_approved_at,
+  };
+}
 
 async function listStudentsForDashboard() {
   const studentsRes = await query(`
@@ -289,6 +326,100 @@ async function upsertStudentPrescreen(studentId, payload) {
   }
 }
 
+async function getStudentMissions(studentId) {
+  const res = await query(
+    `SELECT *
+     FROM public.missions
+     WHERE student_id = $1
+     ORDER BY mission_id`,
+    [studentId],
+  );
+
+  const byId = {};
+  res.rows.forEach((row) => {
+    byId[row.mission_id] = shapeMissionRow(row);
+  });
+
+  const missions = {};
+  MISSION_IDS.forEach((mid) => {
+    const existing = byId[mid] || {
+      missionId: mid,
+      status: "not_started",
+      v1: null,
+      v2: null,
+      v3: null,
+      submittedAt: null,
+      v2SubmittedAt: null,
+      kerryFeedback: "",
+      feedbackStatus: "none",
+      feedbackApprovedAt: null,
+    };
+    missions[mid] = {
+      ...existing,
+      unlocked: isMissionUnlocked({ ...byId, ...missions }, mid),
+    };
+  });
+
+  return missions;
+}
+
+async function saveMissionProgress(studentId, missionId, payload = {}) {
+  if (!isValidMissionId(missionId)) throw new Error("Invalid mission id");
+  const missions = await getStudentMissions(studentId);
+  if (!missions[missionId]?.unlocked) throw new Error("Mission is locked");
+
+  const v1 = payload.v1 !== undefined ? payload.v1 : missions[missionId].v1;
+  const v2 = payload.v2 !== undefined ? payload.v2 : missions[missionId].v2;
+
+  await query(
+    `INSERT INTO public.missions (student_id, mission_id, status, v1, v2)
+     VALUES ($1, $2, 'not_started', $3, $4)
+     ON CONFLICT (student_id, mission_id)
+     DO UPDATE SET v1 = COALESCE(EXCLUDED.v1, public.missions.v1),
+                   v2 = COALESCE(EXCLUDED.v2, public.missions.v2)`,
+    [studentId, missionId, v1 ? JSON.stringify(v1) : null, v2 ? JSON.stringify(v2) : null],
+  );
+}
+
+async function submitMissionVersion(studentId, missionId, versionKey, versionData) {
+  if (!isValidMissionId(missionId)) throw new Error("Invalid mission id");
+  if (!["v1", "v2"].includes(versionKey)) throw new Error("Invalid mission version");
+
+  const missions = await getStudentMissions(studentId);
+  if (!missions[missionId]?.unlocked) throw new Error("Mission is locked");
+  const isComplete = countVersionPics(versionData) >= 3;
+
+  if (versionKey === "v1") {
+    await query(
+      `INSERT INTO public.missions (student_id, mission_id, status, v1, submitted_at)
+       VALUES ($1, $2, $3, $4, CASE WHEN $3 = 'submitted' THEN now() ELSE NULL END)
+       ON CONFLICT (student_id, mission_id)
+       DO UPDATE SET status = EXCLUDED.status,
+                     v1 = EXCLUDED.v1,
+                     submitted_at = CASE
+                       WHEN EXCLUDED.status = 'submitted' THEN now()
+                       ELSE public.missions.submitted_at
+                     END`,
+      [studentId, missionId, isComplete ? "submitted" : "in_progress", JSON.stringify(versionData)],
+    );
+    return { complete: isComplete, status: isComplete ? "submitted" : "in_progress" };
+  }
+
+  await query(
+    `INSERT INTO public.missions (student_id, mission_id, status, v2, v2_submitted_at)
+     VALUES ($1, $2, $3, $4, CASE WHEN $3 = 'submitted' THEN now() ELSE NULL END)
+     ON CONFLICT (student_id, mission_id)
+     DO UPDATE SET status = EXCLUDED.status,
+                   v2 = EXCLUDED.v2,
+                   v2_submitted_at = CASE
+                     WHEN EXCLUDED.status = 'submitted' THEN now()
+                     ELSE public.missions.v2_submitted_at
+                   END`,
+    [studentId, missionId, isComplete ? "submitted" : "in_progress", JSON.stringify(versionData)],
+  );
+  return { complete: isComplete, status: isComplete ? "submitted" : "in_progress" };
+}
+
 module.exports = {
   listStudentsForDashboard,
   updateStudentFeedback,
@@ -296,4 +427,7 @@ module.exports = {
   replyToQuestion,
   getStudentPrescreen,
   upsertStudentPrescreen,
+  getStudentMissions,
+  saveMissionProgress,
+  submitMissionVersion,
 };

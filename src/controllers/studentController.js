@@ -5,6 +5,9 @@ const {
   replyToQuestion,
   getStudentPrescreen,
   upsertStudentPrescreen,
+  getStudentMissions,
+  saveMissionProgress,
+  submitMissionVersion,
 } = require("../services/studentService");
 
 async function getStudents(req, res, next) {
@@ -69,6 +72,46 @@ async function putPrescreenByStudent(req, res, next) {
   }
 }
 
+async function getMissionsByStudent(req, res, next) {
+  try {
+    const { studentId } = req.params;
+    const missions = await getStudentMissions(studentId);
+    return res.status(200).json({ data: missions });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function putMissionProgress(req, res, next) {
+  try {
+    const { studentId, missionId } = req.params;
+    await saveMissionProgress(studentId, missionId, req.body || {});
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function postSubmitMissionV1(req, res, next) {
+  try {
+    const { studentId, missionId } = req.params;
+    await submitMissionVersion(studentId, missionId, "v1", req.body?.v1 || {});
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function postSubmitMissionV2(req, res, next) {
+  try {
+    const { studentId, missionId } = req.params;
+    await submitMissionVersion(studentId, missionId, "v2", req.body?.v2 || {});
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   getStudents,
   patchStudentFeedback,
@@ -76,4 +119,8 @@ module.exports = {
   patchQuestionReply,
   getPrescreenByStudent,
   putPrescreenByStudent,
+  getMissionsByStudent,
+  putMissionProgress,
+  postSubmitMissionV1,
+  postSubmitMissionV2,
 };
