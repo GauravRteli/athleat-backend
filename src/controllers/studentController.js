@@ -3,6 +3,8 @@ const {
   updateStudentFeedback,
   updateMissionFeedback,
   replyToQuestion,
+  getStudentPrescreen,
+  upsertStudentPrescreen,
 } = require("../services/studentService");
 
 async function getStudents(req, res, next) {
@@ -47,9 +49,31 @@ async function patchQuestionReply(req, res, next) {
   }
 }
 
+async function getPrescreenByStudent(req, res, next) {
+  try {
+    const { studentId } = req.params;
+    const prescreen = await getStudentPrescreen(studentId);
+    return res.status(200).json({ data: prescreen });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function putPrescreenByStudent(req, res, next) {
+  try {
+    const { studentId } = req.params;
+    await upsertStudentPrescreen(studentId, req.body || {});
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   getStudents,
   patchStudentFeedback,
   patchMissionFeedback,
   patchQuestionReply,
+  getPrescreenByStudent,
+  putPrescreenByStudent,
 };

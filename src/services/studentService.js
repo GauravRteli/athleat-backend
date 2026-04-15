@@ -71,6 +71,7 @@ function shapeDashboardStudent(s, ps, bp, missions, questions) {
         goals: ps.goals || [],
         biggestChallenges: ps.biggest_challenges || [],
         mealPriority: ps.meal_priority,
+        helpAreas: ps.help_areas || [],
         topQuestions: ps.top_questions,
         infoSources: ps.info_sources || [],
         activityType: ps.activity_type || [],
@@ -78,6 +79,7 @@ function shapeDashboardStudent(s, ps, bp, missions, questions) {
         daysMed: ps.days_med != null ? String(ps.days_med) : null,
         daysHigh: ps.days_high != null ? String(ps.days_high) : null,
         sessionLength: ps.session_length,
+        hungerGrid: ps.hunger_grid || {},
       }
     : {};
 
@@ -168,9 +170,130 @@ async function replyToQuestion(questionId, reply) {
   );
 }
 
+async function getStudentPrescreen(studentId) {
+  const res = await query(
+    `SELECT *
+     FROM public.prescreen
+     WHERE student_id = $1
+     ORDER BY completed_at DESC NULLS LAST, id DESC
+     LIMIT 1`,
+    [studentId],
+  );
+  return res.rows[0] || null;
+}
+
+async function upsertStudentPrescreen(studentId, payload) {
+  const completedAt = payload.completed_at || new Date().toISOString();
+  const hungerGrid = payload.hunger_grid || null;
+  const values = [
+    studentId,
+    payload.dob || null,
+    payload.school_year || null,
+    payload.referral || null,
+    payload.ethnicity || null,
+    payload.blood_test || null,
+    payload.medical || null,
+    payload.medical_dates || null,
+    payload.supplements || null,
+    payload.sex || null,
+    payload.menstrual || null,
+    payload.height_cm != null && payload.height_cm !== "" ? Number(payload.height_cm) : null,
+    payload.weight_kg != null && payload.weight_kg !== "" ? Number(payload.weight_kg) : null,
+    payload.weight_trend || null,
+    payload.living_with || null,
+    payload.cooking || null,
+    payload.cooking_skills || null,
+    payload.fav_foods || null,
+    payload.dislike_foods || null,
+    payload.dietary_reqs || null,
+    payload.eating_style || null,
+    payload.takeaway_frequency || null,
+    payload.takeaway_foods || null,
+    payload.goals || null,
+    payload.biggest_challenges || null,
+    payload.meal_priority || null,
+    payload.help_areas || null,
+    payload.top_questions || null,
+    payload.info_sources || null,
+    payload.activity_type || null,
+    payload.days_low != null && payload.days_low !== "" ? Number(payload.days_low) : null,
+    payload.days_med != null && payload.days_med !== "" ? Number(payload.days_med) : null,
+    payload.days_high != null && payload.days_high !== "" ? Number(payload.days_high) : null,
+    payload.session_length || null,
+    hungerGrid ? JSON.stringify(hungerGrid) : null,
+    completedAt,
+  ];
+
+  const updateRes = await query(
+    `UPDATE public.prescreen
+     SET dob = $2,
+         school_year = $3,
+         referral = $4,
+         ethnicity = $5,
+         blood_test = $6,
+         medical = $7,
+         medical_dates = $8,
+         supplements = $9,
+         sex = $10,
+         menstrual = $11,
+         height_cm = $12,
+         weight_kg = $13,
+         weight_trend = $14,
+         living_with = $15,
+         cooking = $16,
+         cooking_skills = $17,
+         fav_foods = $18,
+         dislike_foods = $19,
+         dietary_reqs = $20,
+         eating_style = $21,
+         takeaway_frequency = $22,
+         takeaway_foods = $23,
+         goals = $24,
+         biggest_challenges = $25,
+         meal_priority = $26,
+         help_areas = $27,
+         top_questions = $28,
+         info_sources = $29,
+         activity_type = $30,
+         days_low = $31,
+         days_med = $32,
+         days_high = $33,
+         session_length = $34,
+         hunger_grid = $35,
+         completed_at = $36
+     WHERE student_id = $1`,
+    values,
+  );
+
+  if (updateRes.rowCount === 0) {
+    await query(
+      `INSERT INTO public.prescreen (
+        student_id, dob, school_year, referral, ethnicity, blood_test,
+        medical, medical_dates, supplements, sex, menstrual,
+        height_cm, weight_kg, weight_trend, living_with, cooking, cooking_skills,
+        fav_foods, dislike_foods, dietary_reqs, eating_style,
+        takeaway_frequency, takeaway_foods, goals, biggest_challenges,
+        meal_priority, help_areas, top_questions, info_sources, activity_type,
+        days_low, days_med, days_high, session_length, hunger_grid, completed_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6,
+        $7, $8, $9, $10, $11,
+        $12, $13, $14, $15, $16, $17,
+        $18, $19, $20, $21,
+        $22, $23, $24, $25,
+        $26, $27, $28, $29, $30,
+        $31, $32, $33, $34, $35, $36
+      )`,
+      values,
+    );
+  }
+}
+
 module.exports = {
   listStudentsForDashboard,
   updateStudentFeedback,
   updateMissionFeedback,
   replyToQuestion,
+  getStudentPrescreen,
+  upsertStudentPrescreen,
 };
