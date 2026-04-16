@@ -1,0 +1,194 @@
+const { query } = require("../config/postgres");
+const MISSION_IDS = ["m1", "m2", "m3", "m4", "m5"];
+
+function splitName(fullName) {
+  const parts = String(fullName || "").trim().split(" ").filter(Boolean);
+  return {
+    firstName: parts[0] || "",
+    lastName: parts.slice(1).join(" "),
+  };
+}
+
+function shapeAthlete(row) {
+  const fallback = splitName(row.full_name);
+  return {
+    id: row.id,
+    firstName: row.first_name || fallback.firstName,
+    lastName: row.last_name || fallback.lastName,
+    email: row.email || "",
+  };
+}
+
+async function getAthleteById(studentId) {
+  const result = await query(
+    `SELECT id, first_name, last_name, full_name, email
+     FROM public.students WHERE id = $1 LIMIT 1`,
+    [studentId],
+  );
+  return result.rows[0] || null;
+}
+
+async function getAthleteMe(studentId) {
+  const row = await getAthleteById(studentId);
+  if (!row) return null;
+
+  const unlockRes = await query(
+    `SELECT module_key FROM public.student_unlocks WHERE student_id = $1 ORDER BY unlocked_at ASC`,
+    [studentId],
+  );
+  const unlocks = ["pre-screen", ...unlockRes.rows.map((r) => r.module_key)].filter(
+    (v, i, arr) => arr.indexOf(v) === i,
+  );
+
+  return { athlete: shapeAthlete(row), unlocks };
+}
+
+async function upsertUnlock(studentId, moduleKey) {
+  const res = await query(
+    `INSERT INTO public.student_unlocks (student_id, module_key, unlocked_at)
+     VALUES ($1, $2, now())
+     ON CONFLICT (student_id, module_key)
+     DO UPDATE SET unlocked_at = public.student_unlocks.unlocked_at
+     RETURNING module_key, unlocked_at`,
+    [studentId, moduleKey],
+  );
+  return {
+    moduleKey: res.rows[0].module_key,
+    unlockedAt: res.rows[0].unlocked_at,
+  };
+}
+
+function toModuleKey(missionId, suffix) {
+  const number = String(missionId || "").replace("m", "");
+  return number ? `mission-${number}-${suffix}` : null;
+}
+
+function resolveMissionProgressionTargets(eventKey, missionId) {
+  const idx = MISSION_IDS.indexOf(missionId);
+  if (idx < 0) return [];
+  if (eventKey === "mission_v1_submitted") {
+    const key = toModuleKey(missionId, "v23");
+    return key ? [key] : [];
+  }
+  if (eventKey === "mission_v2_submitted") {
+    const nextMissionId = MISSION_IDS[idx + 1];
+    if (!nextMissionId) return [];
+    const key = toModuleKey(nextMissionId, "v1");
+    return key ? [key] : [];
+  }
+  return [];
+}
+
+async function applyUnlockProgression(studentId, eventKey, context = {}) {
+  const staticEventToUnlocks = {
+    prescreen_submitted: ["food-preferences"],
+    food_preferences_saved: ["mission-1-v1"],
+  };
+  const dynamicTargets = resolveMissionProgressionTargets(eventKey, context.missionId);
+  const unlockTargets = [...(staticEventToUnlocks[eventKey] || []), ...dynamicTargets];
+  if (!unlockTargets.length) return [];
+
+  const newlyUnlocked = [];
+  for (const moduleKey of unlockTargets) {
+    const res = await query(
+      `INSERT INTO public.student_unlocks (student_id, module_key, unlocked_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (student_id, module_key) DO NOTHING
+       RETURNING module_key`,
+      [studentId, moduleKey],
+    );
+    if (res.rows[0]?.module_key) newlyUnlocked.push(res.rows[0].module_key);
+  }
+  return newlyUnlocked;
+}
+
+function shapeMission(row) {
+  return {
+    id: row.id,
+    missionId: row.mission_id,
+    status: row.status || "not_started",
+    v1: row.v1 || null,
+    v2: row.v2 || null,
+    v3: row.v3 || null,
+    submittedAt: row.submitted_at,
+    v2SubmittedAt: row.v2_submitted_at,
+    kerryFeedback: row.kerry_feedback || "",
+    feedbackStatus: row.feedback_status || "none",
+    feedbackApprovedAt: row.feedback_approved_at,
+  };
+}
+
+async function getAthleteMissions(studentId) {
+  const result = await query(
+    `SELECT *
+     FROM public.missions
+     WHERE student_id = $1
+     ORDER BY mission_id`,
+    [studentId],
+  );
+
+  const byId = {};
+  result.rows.forEach((row) => {
+    byId[row.mission_id] = shapeMission(row);
+  });
+
+  const missions = {};
+  MISSION_IDS.forEach((missionId) => {
+    missions[missionId] =
+      byId[missionId] ||
+      {
+        missionId,
+        status: "not_started",
+        v1: null,
+        v2: null,
+        v3: null,
+        submittedAt: null,
+        v2SubmittedAt: null,
+        kerryFeedback: "",
+        feedbackStatus: "none",
+        feedbackApprovedAt: null,
+      };
+  });
+
+  return missions;
+}
+
+async function getFoodPrefs(studentId) {
+  const res = await query(
+    `SELECT selections, completed_at
+     FROM public.student_food_preferences
+     WHERE student_id = $1
+     LIMIT 1`,
+    [studentId],
+  );
+  const row = res.rows[0];
+  return {
+    selections: row?.selections || {},
+    completedAt: row?.completed_at || null,
+  };
+}
+
+async function upsertFoodPrefs(studentId, selections, completedAt) {
+  await query(
+    `INSERT INTO public.student_food_preferences
+      (student_id, selections, completed_at, updated_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (student_id)
+     DO UPDATE SET
+       selections = EXCLUDED.selections,
+       completed_at = EXCLUDED.completed_at,
+       updated_at = now()`,
+    [studentId, JSON.stringify(selections || {}), completedAt],
+  );
+  const newlyUnlocked = await applyUnlockProgression(studentId, "food_preferences_saved");
+  return { ok: true, newlyUnlocked };
+}
+
+module.exports = {
+  getAthleteMe,
+  getAthleteMissions,
+  upsertUnlock,
+  applyUnlockProgression,
+  getFoodPrefs,
+  upsertFoodPrefs,
+};

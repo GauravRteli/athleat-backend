@@ -1,4 +1,5 @@
 const { query } = require("../config/postgres");
+const { applyUnlockProgression } = require("./athleteService");
 const MISSION_IDS = ["m1", "m2", "m3", "m4", "m5"];
 
 function isValidMissionId(missionId) {
@@ -324,6 +325,7 @@ async function upsertStudentPrescreen(studentId, payload) {
       values,
     );
   }
+  await applyUnlockProgression(studentId, "prescreen_submitted");
 }
 
 async function getStudentMissions(studentId) {
@@ -402,6 +404,9 @@ async function submitMissionVersion(studentId, missionId, versionKey, versionDat
                      END`,
       [studentId, missionId, isComplete ? "submitted" : "in_progress", JSON.stringify(versionData)],
     );
+    if (isComplete) {
+      await applyUnlockProgression(studentId, "mission_v1_submitted", { missionId });
+    }
     return { complete: isComplete, status: isComplete ? "submitted" : "in_progress" };
   }
 
@@ -417,6 +422,9 @@ async function submitMissionVersion(studentId, missionId, versionKey, versionDat
                    END`,
     [studentId, missionId, isComplete ? "submitted" : "in_progress", JSON.stringify(versionData)],
   );
+  if (isComplete) {
+    await applyUnlockProgression(studentId, "mission_v2_submitted", { missionId });
+  }
   return { complete: isComplete, status: isComplete ? "submitted" : "in_progress" };
 }
 
