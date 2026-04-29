@@ -5,6 +5,10 @@ const missionConfigRoutes = require("./missionConfigRoutes");
 const uploadRoutes = require("./uploadRoutes");
 const authRoutes = require("./authRoutes");
 const athleteRoutes = require("./athleteRoutes");
+const knowledgeEntriesRoutes = require("./knowledgeEntriesRoutes");
+const mealsRoutes = require("./mealsRoutes");
+const foodsRoutes = require("./foodsRoutes");
+const eerConfigRoutes = require("./eerConfigRoutes");
 
 const router = express.Router();
 
@@ -14,5 +18,9 @@ router.use("/athlete", athleteRoutes);
 router.use("/students", studentRoutes);
 router.use("/mission-config", missionConfigRoutes);
 router.use("/uploads", uploadRoutes);
+router.use("/knowledge-entries", knowledgeEntriesRoutes);
+router.use("/meals", mealsRoutes);
+router.use("/foods", foodsRoutes);
+router.use("/eer-config", eerConfigRoutes);
 
 module.exports = router;

@@ -52,12 +52,16 @@ async function listStudentsForDashboard() {
 
   const ids = students.map((s) => s.id);
 
-  const [prescreenRes, blueprintRes, missionsRes, questionsRes] =
+  const [prescreenRes, blueprintRes, missionsRes, questionsRes, foodPrefsRes] =
     await Promise.all([
       query(`SELECT * FROM public.prescreen WHERE student_id = ANY($1)`, [ids]),
       query(`SELECT * FROM public.blueprint_answers WHERE student_id = ANY($1)`, [ids]),
       query(`SELECT * FROM public.missions WHERE student_id = ANY($1) ORDER BY mission_id`, [ids]),
       query(`SELECT * FROM public.questions WHERE student_id = ANY($1) ORDER BY asked_at`, [ids]),
+      query(
+        `SELECT student_id, selections, completed_at FROM public.student_food_preferences WHERE student_id = ANY($1)`,
+        [ids],
+      ),
     ]);
 
   const prescreenMap = {};
@@ -78,10 +82,27 @@ async function listStudentsForDashboard() {
     questionsMap[r.student_id].push(r);
   });
 
-  return students.map((s) => shapeDashboardStudent(s, prescreenMap[s.id], blueprintMap[s.id], missionsMap[s.id], questionsMap[s.id]));
+  const foodPrefsMap = {};
+  foodPrefsRes.rows.forEach((r) => {
+    foodPrefsMap[r.student_id] = {
+      selections: r.selections || {},
+      completedAt: r.completed_at,
+    };
+  });
+
+  return students.map((s) =>
+    shapeDashboardStudent(
+      s,
+      prescreenMap[s.id],
+      blueprintMap[s.id],
+      missionsMap[s.id],
+      questionsMap[s.id],
+      foodPrefsMap[s.id],
+    ),
+  );
 }
 
-function shapeDashboardStudent(s, ps, bp, missions, questions) {
+function shapeDashboardStudent(s, ps, bp, missions, questions, foodPrefs) {
   const prescreen = ps
     ? {
         dob: ps.dob,
@@ -176,6 +197,7 @@ function shapeDashboardStudent(s, ps, bp, missions, questions) {
     questAnswers,
     missions: shapedMissions,
     questions: shapedQuestions,
+    food_preferences: foodPrefs || { selections: {}, completedAt: null },
   };
 }
 
