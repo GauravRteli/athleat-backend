@@ -1,66 +1,195 @@
+// =============================================================================
+// foodsService — adapter onto the legacy `public.items` table.
+//
+// Exposes a per-100g normalised "food" shape compatible with the existing
+// frontend contract (food_name / energy_kj / protein_g / carb_g / fat_g …).
+// The legacy `items` row stores macros per serving + a numeric `serving_size`,
+// so we normalise to per-100g for display.
+// =============================================================================
+
 const { query } = require("../config/postgres");
 
-function shape(row) {
+const num = (v) => {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+// "441.0kJ" → 441
+const parseEnergy = (val) => {
+  if (val === null || val === undefined) return null;
+  const m = String(val).match(/-?\d+(?:\.\d+)?/);
+  return m ? Number(m[0]) : null;
+};
+
+function shapeItem(row) {
+  const energyKj = parseEnergy(row.energy);
   return {
     id: row.id,
-    food_name: row.food_name,
-    serving_label: row.serving_label,
-    weight_g: row.weight_g != null ? Number(row.weight_g) : null,
-    energy_kj: row.energy_kj != null ? Number(row.energy_kj) : null,
-    energy_kcal: row.energy_kcal != null ? Number(row.energy_kcal) : null,
-    protein_g: row.protein_g != null ? Number(row.protein_g) : null,
-    carb_g: row.carb_g != null ? Number(row.carb_g) : null,
-    fat_g: row.fat_g != null ? Number(row.fat_g) : null,
-    fibre_g: row.fibre_g != null ? Number(row.fibre_g) : null,
+    food_name: row.title,
+    title: row.title,
+    description: row.description,
+    note: row.note,
+    image: row.image,
+    serving_label: row.serving_size_unit
+      ? `${row.serving_size || ""} ${row.serving_size_unit}`.trim()
+      : row.serving_size || null,
+    weight_g: num(row.serving_size),
+    energy_kj: energyKj,
+    energy_kcal: energyKj != null ? Math.round(energyKj / 4.184) : null,
+    protein_g: num(row.protein),
+    carb_g: num(row.carbs),
+    fat_g: num(row.fat),
+    fibre_g: parseEnergy(row.dietary_fibre),
+    sodium: row.sodium,
+    sugars: row.sugars,
+    saturated: row.saturated,
+    serving_per_pack: row.serving_per_pack,
+    serving_size: row.serving_size,
+    serving_size_unit: row.serving_size_unit,
+    qty: row.qty,
+    unit: row.unit,
+    selected_qty_unit: row.selected_qty_unit,
     category: row.category,
-    source: row.source,
-    is_active: row.is_active,
+    category_id: row.category_id,
+    is_swiped: row.is_swiped,
+    is_extra: row.is_extra,
+    is_locked: row.is_locked,
+    is_active: !row.is_locked, // legacy `items` has no is_active; expose `is_locked` inversely
     created_at: row.created_at,
+    updated_at: row.updated_at,
   };
 }
 
-async function listFoods({ search, category, limit = 50 } = {}) {
-  const conditions = ["is_active = true"];
+async function listFoods({ search, category, categoryId, limit = 50 } = {}) {
+  const conditions = [];
   const params = [];
   if (search) {
     params.push(`%${search}%`);
-    conditions.push(`food_name ILIKE $${params.length}`);
+    conditions.push(`title ILIKE $${params.length}`);
   }
   if (category) {
     params.push(category);
     conditions.push(`category = $${params.length}`);
   }
-  params.push(Math.min(Number(limit) || 50, 200));
+  if (categoryId) {
+    params.push(Number(categoryId));
+    conditions.push(`category_id = $${params.length}`);
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  params.push(Math.min(Number(limit) || 50, 500));
   const result = await query(
-    `SELECT * FROM public.foods WHERE ${conditions.join(" AND ")} ORDER BY food_name ASC LIMIT $${params.length}`,
+    `SELECT * FROM public.items ${where} ORDER BY title ASC LIMIT $${params.length}`,
     params,
   );
-  return result.rows.map(shape);
+  return result.rows.map(shapeItem);
+}
+
+async function getFoodById(id) {
+  const result = await query(`SELECT * FROM public.items WHERE id = $1 LIMIT 1`, [id]);
+  return result.rows[0] ? shapeItem(result.rows[0]) : null;
 }
 
 async function createFood(payload) {
+  // Map dashboard-style payload onto the legacy `items` columns.
+  // The dashboard provides per-100g macros under {protein_g, carb_g, fat_g, energy_kj}.
+  const energyKj = num(payload.energy_kj);
+  const energyStr = energyKj != null ? `${energyKj}kJ` : payload.energy || null;
+
   const result = await query(
-    `INSERT INTO public.foods
-      (food_name, serving_label, weight_g, energy_kj, energy_kcal,
-       protein_g, carb_g, fat_g, fibre_g, category, source, is_active)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,COALESCE($12, true))
+    `INSERT INTO public.items
+       (title, description, note, protein, carbs, fat, energy,
+        saturated, sugars, dietary_fibre, sodium,
+        serving_per_pack, serving_size, serving_size_unit,
+        category, image, qty, unit, selected_qty_unit,
+        is_swiped, is_extra, is_locked, category_id, woolworth_json)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+             COALESCE($20,false), COALESCE($21,false), COALESCE($22,false), $23, $24)
      RETURNING *`,
     [
-      payload.food_name,
-      payload.serving_label || null,
-      payload.weight_g || null,
-      payload.energy_kj || null,
-      payload.energy_kcal || null,
-      payload.protein_g || null,
-      payload.carb_g || null,
-      payload.fat_g || null,
-      payload.fibre_g || null,
+      payload.title || payload.food_name,
+      payload.description || null,
+      payload.note || null,
+      num(payload.protein_g) ?? num(payload.protein) ?? 0,
+      num(payload.carb_g) ?? num(payload.carbs) ?? 0,
+      num(payload.fat_g) ?? num(payload.fat),
+      energyStr,
+      payload.saturated || null,
+      payload.sugars || null,
+      payload.dietary_fibre || (num(payload.fibre_g) != null ? `${num(payload.fibre_g)}g` : null),
+      payload.sodium || null,
+      payload.serving_per_pack || null,
+      payload.serving_size || (num(payload.weight_g) != null ? String(num(payload.weight_g)) : null),
+      payload.serving_size_unit || "g",
       payload.category || null,
-      payload.source || null,
-      payload.is_active,
+      payload.image || null,
+      payload.qty || null,
+      payload.unit || null,
+      payload.selected_qty_unit || null,
+      payload.is_swiped,
+      payload.is_extra,
+      payload.is_locked,
+      payload.category_id || null,
+      payload.woolworth_json || null,
     ],
   );
-  return shape(result.rows[0]);
+  return shapeItem(result.rows[0]);
 }
 
-module.exports = { listFoods, createFood };
+async function updateFood(id, payload) {
+  const fields = [];
+  const values = [];
+  let i = 1;
+  const set = (col, val) => {
+    if (val === undefined) return;
+    fields.push(`${col} = $${i++}`);
+    values.push(val);
+  };
+
+  set("title", payload.title ?? payload.food_name);
+  set("description", payload.description);
+  set("note", payload.note);
+  set("protein", payload.protein_g ?? payload.protein);
+  set("carbs", payload.carb_g ?? payload.carbs);
+  set("fat", payload.fat_g ?? payload.fat);
+  if (payload.energy_kj !== undefined) set("energy", `${num(payload.energy_kj)}kJ`);
+  else set("energy", payload.energy);
+  set("saturated", payload.saturated);
+  set("sugars", payload.sugars);
+  set("dietary_fibre", payload.dietary_fibre);
+  set("sodium", payload.sodium);
+  set("serving_per_pack", payload.serving_per_pack);
+  set("serving_size", payload.serving_size ?? (payload.weight_g != null ? String(payload.weight_g) : undefined));
+  set("serving_size_unit", payload.serving_size_unit);
+  set("category", payload.category);
+  set("image", payload.image);
+  set("qty", payload.qty);
+  set("unit", payload.unit);
+  set("selected_qty_unit", payload.selected_qty_unit);
+  set("is_swiped", payload.is_swiped);
+  set("is_extra", payload.is_extra);
+  set("is_locked", payload.is_locked);
+  set("category_id", payload.category_id);
+
+  if (!fields.length) return await getFoodById(id);
+  fields.push("updated_at = now()");
+  values.push(id);
+  await query(
+    `UPDATE public.items SET ${fields.join(", ")} WHERE id = $${i}`,
+    values,
+  );
+  return await getFoodById(id);
+}
+
+async function deleteFood(id) {
+  await query(`DELETE FROM public.items WHERE id = $1`, [id]);
+}
+
+module.exports = {
+  shapeItem,
+  listFoods,
+  getFoodById,
+  createFood,
+  updateFood,
+  deleteFood,
+};
