@@ -61,7 +61,7 @@ function shapeItem(row) {
   };
 }
 
-async function listFoods({ search, category, categoryId, limit = 50 } = {}) {
+async function listFoods({ search, category, categoryId, limit, offset } = {}) {
   const conditions = [];
   const params = [];
   if (search) {
@@ -77,12 +77,30 @@ async function listFoods({ search, category, categoryId, limit = 50 } = {}) {
     conditions.push(`category_id = $${params.length}`);
   }
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  params.push(Math.min(Number(limit) || 50, 500));
+
+  // Pagination — clamp limit to a generous max; offset must be >= 0.
+  const lim = Math.max(1, Math.min(Number(limit) || 50, 5000));
+  const off = Math.max(0, Number(offset) || 0);
+
+  params.push(lim);
+  const limIdx = params.length;
+  params.push(off);
+  const offIdx = params.length;
+
   const result = await query(
-    `SELECT * FROM public.items ${where} ORDER BY title ASC LIMIT $${params.length}`,
+    `SELECT *, COUNT(*) OVER() AS __total
+       FROM public.items
+       ${where}
+      ORDER BY title ASC
+      LIMIT $${limIdx} OFFSET $${offIdx}`,
     params,
   );
-  return result.rows.map(shapeItem);
+  const total = result.rows[0] ? Number(result.rows[0].__total) : 0;
+  const rows = result.rows.map((row) => {
+    const { __total, ...rest } = row;
+    return shapeItem(rest);
+  });
+  return { rows, total, limit: lim, offset: off };
 }
 
 async function getFoodById(id) {

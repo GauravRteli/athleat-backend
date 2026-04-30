@@ -8,13 +8,14 @@ const {
 
 async function getAll(req, res, next) {
   try {
-    const data = await listFoods({
+    const { rows, total, limit, offset } = await listFoods({
       search: req.query.search || undefined,
       category: req.query.category || undefined,
       categoryId: req.query.category_id || undefined,
       limit: req.query.limit,
+      offset: req.query.offset,
     });
-    return res.status(200).json({ data });
+    return res.status(200).json({ data: rows, total, limit, offset });
   } catch (error) {
     return next(error);
   }
