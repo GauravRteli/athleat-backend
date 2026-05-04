@@ -12,6 +12,8 @@ async function getAll(req, res, next) {
       search: req.query.search || undefined,
       category: req.query.category || undefined,
       categoryId: req.query.category_id || undefined,
+      flagCategoryId: req.query.flag_category_id || undefined,
+      flagId: req.query.flag_id || undefined,
       limit: req.query.limit,
       offset: req.query.offset,
     });

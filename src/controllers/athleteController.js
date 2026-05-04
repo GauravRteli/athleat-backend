@@ -4,6 +4,7 @@ const {
   upsertUnlock,
   getFoodPrefs,
   upsertFoodPrefs,
+  getFoodPrefsCatalog,
 } = require("../services/athleteService");
 const { submitMissionVersion } = require("../services/studentService");
 
@@ -44,6 +45,15 @@ async function postFoodPreferences(req, res, next) {
     const completedAt = req.body?.completedAt || new Date().toISOString();
     const data = await upsertFoodPrefs(req.auth.studentId, selections, completedAt);
     return res.status(200).json(data);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function getFoodPreferencesCatalog(req, res, next) {
+  try {
+    const data = await getFoodPrefsCatalog();
+    return res.status(200).json({ categories: data });
   } catch (error) {
     return next(error);
   }
@@ -93,6 +103,7 @@ module.exports = {
   postUnlock,
   getFoodPreferences,
   postFoodPreferences,
+  getFoodPreferencesCatalog,
   getMissions,
   postSubmitMissionV1,
   postSubmitMissionV2,

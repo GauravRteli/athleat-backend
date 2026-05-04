@@ -18,4 +18,11 @@ router.post("/tags", c.postTag);
 router.patch("/tags/:id", c.patchTag);
 router.delete("/tags/:id", c.deleteTag);
 
+// Flag taxonomy (surfaced as Category / Sub Category in the Library UI).
+// These are read-only and unauthenticated so the Kerry dashboard can use
+// them without an athlete token.
+router.get("/flag-categories", c.getFlagCategories);
+router.get("/flags", c.getFlags);
+router.get("/flag-catalog", c.getFlagCatalog);
+
 module.exports = router;

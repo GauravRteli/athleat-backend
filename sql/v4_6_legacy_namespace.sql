@@ -81,7 +81,11 @@ DECLARE
     ['public.meal_category',        'meal_category_id_seq'],
     ['public.meal_sub_category',    'meal_sub_category_id_seq'],
     ['public.meal_tag',             'meal_tag_id_seq'],
-    ['public.goal_histories',       'goal_histories_id_seq']
+    ['public.goal_histories',       'goal_histories_id_seq'],
+    ['public.flags',                      'flags_id_seq'],
+    ['public.flag_item',                  'flag_item_id_seq'],
+    ['public.flag_categories',            'flag_categories_id_seq'],
+    ['public.flags_categories_flag',      'flags_categories_flag_id_seq']
   ];
   i int;
   tbl text;

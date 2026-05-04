@@ -4,6 +4,7 @@ const {
   postUnlock,
   getFoodPreferences,
   postFoodPreferences,
+  getFoodPreferencesCatalog,
   getMissions,
   postSubmitMissionV1,
   postSubmitMissionV2,
@@ -15,6 +16,7 @@ const router = express.Router();
 router.use(requireAthleteAuth);
 router.get("/me", getMe);
 router.post("/unlock", postUnlock);
+router.get("/food-prefs/catalog", getFoodPreferencesCatalog);
 router.get("/food-prefs", getFoodPreferences);
 router.post("/food-prefs", postFoodPreferences);
 router.get("/missions", getMissions);

@@ -37,4 +37,9 @@ module.exports = {
     await svc.deleteTag(req.params.id);
     return { ok: true };
   }),
+
+  // flag taxonomy (surfaced as Category / Sub Category in the Library UI)
+  getFlagCategories: wrap(() => svc.listFlagCategories()),
+  getFlags: wrap((req) => svc.listFlags({ flagCategoryId: req.query.flag_category_id })),
+  getFlagCatalog: wrap(() => svc.listFlagCatalog()),
 };

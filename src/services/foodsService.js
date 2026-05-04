@@ -61,22 +61,53 @@ function shapeItem(row) {
   };
 }
 
-async function listFoods({ search, category, categoryId, limit, offset } = {}) {
+async function listFoods({
+  search,
+  category,
+  categoryId,
+  flagCategoryId,
+  flagId,
+  limit,
+  offset,
+} = {}) {
   const conditions = [];
+  const joins = [];
   const params = [];
+
   if (search) {
     params.push(`%${search}%`);
-    conditions.push(`title ILIKE $${params.length}`);
+    conditions.push(`items.title ILIKE $${params.length}`);
   }
   if (category) {
     params.push(category);
-    conditions.push(`category = $${params.length}`);
+    conditions.push(`items.category = $${params.length}`);
   }
   if (categoryId) {
     params.push(Number(categoryId));
-    conditions.push(`category_id = $${params.length}`);
+    conditions.push(`items.category_id = $${params.length}`);
   }
+
+  // Flag filters — items can be tagged with multiple flags via flag_item.
+  // Specific flag wins over category when both are provided.
+  if (flagId) {
+    params.push(Number(flagId));
+    joins.push(
+      `JOIN public.flag_item fi ON fi.item_id = items.id AND fi.flag_id = $${params.length}`,
+    );
+  } else if (flagCategoryId) {
+    params.push(Number(flagCategoryId));
+    joins.push(
+      `JOIN public.flag_item fi ON fi.item_id = items.id`,
+      `JOIN public.flags_categories_flag fcf ON fcf.flag_id = fi.flag_id AND fcf.flag_category_id = $${params.length}`,
+    );
+  }
+
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const joinClause = joins.length ? joins.join("\n       ") : "";
+  // DISTINCT guards against an item being duplicated when it's tagged with
+  // multiple flags inside the same flag_category.
+  const usingDistinct = joins.length > 0;
+  const selectClause = usingDistinct ? "DISTINCT items.*" : "items.*";
 
   // Pagination — clamp limit to a generous max; offset must be >= 0.
   const lim = Math.max(1, Math.min(Number(limit) || 50, 5000));
@@ -87,19 +118,46 @@ async function listFoods({ search, category, categoryId, limit, offset } = {}) {
   params.push(off);
   const offIdx = params.length;
 
-  const result = await query(
-    `SELECT *, COUNT(*) OVER() AS __total
-       FROM public.items
-       ${where}
-      ORDER BY title ASC
-      LIMIT $${limIdx} OFFSET $${offIdx}`,
-    params,
-  );
-  const total = result.rows[0] ? Number(result.rows[0].__total) : 0;
-  const rows = result.rows.map((row) => {
-    const { __total, ...rest } = row;
-    return shapeItem(rest);
-  });
+  // Counting with DISTINCT + window function is awkward, so when joins are
+  // active we run a separate COUNT query; otherwise reuse the window count.
+  let total = 0;
+  let rows;
+  if (usingDistinct) {
+    const countResult = await query(
+      `SELECT COUNT(DISTINCT items.id) AS total
+         FROM public.items
+         ${joinClause}
+         ${where}`,
+      params.slice(0, params.length - 2),
+    );
+    total = countResult.rows[0] ? Number(countResult.rows[0].total) : 0;
+
+    const result = await query(
+      `SELECT ${selectClause}
+         FROM public.items
+         ${joinClause}
+         ${where}
+        ORDER BY items.title ASC
+        LIMIT $${limIdx} OFFSET $${offIdx}`,
+      params,
+    );
+    rows = result.rows.map((row) => shapeItem(row));
+  } else {
+    const result = await query(
+      `SELECT ${selectClause}, COUNT(*) OVER() AS __total
+         FROM public.items
+         ${where}
+        ORDER BY items.title ASC
+        LIMIT $${limIdx} OFFSET $${offIdx}`,
+      params,
+    );
+    total = result.rows[0] ? Number(result.rows[0].__total) : 0;
+    rows = result.rows.map((row) => {
+      const { __total, ...rest } = row;
+      return shapeItem(rest);
+    });
+  }
+
   return { rows, total, limit: lim, offset: off };
 }
 

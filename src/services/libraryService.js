@@ -193,6 +193,94 @@ async function deleteTag(id) {
   await query(`DELETE FROM public.tags WHERE id = $1`, [id]);
 }
 
+// ───────────────────────────── flag taxonomy ─────────────────────────────
+//
+// flag_categories  ← top-level groupings (Grains, Meat, Dairy …)
+// flags            ← buckets inside a category (Cereals, Beef, Chicken …)
+// flag_item        ← which items belong to which flag
+//
+// In the Library UI these are surfaced as "Category" and "Sub Category"
+// filters; the underlying tables stay namespaced as flag_* in the schema.
+
+async function listFlagCategories() {
+  const r = await query(
+    `SELECT id, name, created_at, updated_at
+       FROM public.flag_categories
+       ORDER BY id ASC`,
+  );
+  return r.rows;
+}
+
+async function listFlags({ flagCategoryId } = {}) {
+  if (flagCategoryId) {
+    const r = await query(
+      `SELECT fl.id, fl.name, fcf.flag_category_id
+         FROM public.flags fl
+         JOIN public.flags_categories_flag fcf ON fcf.flag_id = fl.id
+        WHERE fcf.flag_category_id = $1
+        ORDER BY fl.name ASC`,
+      [Number(flagCategoryId)],
+    );
+    return r.rows;
+  }
+  const r = await query(
+    `SELECT fl.id, fl.name,
+            (SELECT array_agg(flag_category_id)
+               FROM public.flags_categories_flag
+              WHERE flag_id = fl.id) AS flag_category_ids
+       FROM public.flags fl
+       ORDER BY fl.name ASC`,
+  );
+  return r.rows;
+}
+
+async function listFlagCatalog() {
+  const res = await query(
+    `SELECT
+       fc.id   AS category_id,
+       fc.name AS category_name,
+       fl.id   AS flag_id,
+       fl.name AS flag_name,
+       i.id    AS item_id,
+       i.title AS item_title,
+       i.image AS item_image
+     FROM public.flag_categories fc
+     JOIN public.flags_categories_flag fcf
+       ON fcf.flag_category_id = fc.id
+     JOIN public.flags fl
+       ON fl.id = fcf.flag_id
+     LEFT JOIN public.flag_item fi
+       ON fi.flag_id = fl.id
+     LEFT JOIN public.items i
+       ON i.id = fi.item_id
+     ORDER BY fc.id ASC, fl.name ASC, i.title ASC`,
+  );
+
+  const categoriesById = new Map();
+  for (const row of res.rows) {
+    let cat = categoriesById.get(row.category_id);
+    if (!cat) {
+      cat = { id: row.category_id, name: row.category_name, flags: [], _flagsById: new Map() };
+      categoriesById.set(row.category_id, cat);
+    }
+    let flag = cat._flagsById.get(row.flag_id);
+    if (!flag) {
+      flag = { id: row.flag_id, name: row.flag_name, items: [] };
+      cat._flagsById.set(row.flag_id, flag);
+      cat.flags.push(flag);
+    }
+    if (row.item_id != null) {
+      flag.items.push({
+        id: row.item_id,
+        title: row.item_title,
+        image: row.item_image || null,
+      });
+    }
+  }
+
+  return Array.from(categoriesById.values()).map(({ _flagsById, ...rest }) => rest);
+}
+
 module.exports = {
   listCategories,
   createCategory,
@@ -206,4 +294,7 @@ module.exports = {
   createTag,
   updateTag,
   deleteTag,
+  listFlagCategories,
+  listFlags,
+  listFlagCatalog,
 };

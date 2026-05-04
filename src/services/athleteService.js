@@ -184,6 +184,53 @@ async function upsertFoodPrefs(studentId, selections, completedAt) {
   return { ok: true, newlyUnlocked };
 }
 
+async function getFoodPrefsCatalog() {
+  const res = await query(
+    `SELECT
+       fc.id   AS category_id,
+       fc.name AS category_name,
+       fl.id   AS flag_id,
+       fl.name AS flag_name,
+       i.id    AS item_id,
+       i.title AS item_title,
+       i.image AS item_image
+     FROM public.flag_categories fc
+     JOIN public.flags_categories_flag fcf
+       ON fcf.flag_category_id = fc.id
+     JOIN public.flags fl
+       ON fl.id = fcf.flag_id
+     LEFT JOIN public.flag_item fi
+       ON fi.flag_id = fl.id
+     LEFT JOIN public.items i
+       ON i.id = fi.item_id
+     ORDER BY fc.id ASC, fl.name ASC, i.title ASC`,
+  );
+
+  const categoriesById = new Map();
+  for (const row of res.rows) {
+    let cat = categoriesById.get(row.category_id);
+    if (!cat) {
+      cat = { id: row.category_id, name: row.category_name, flags: [], _flagsById: new Map() };
+      categoriesById.set(row.category_id, cat);
+    }
+    let flag = cat._flagsById.get(row.flag_id);
+    if (!flag) {
+      flag = { id: row.flag_id, name: row.flag_name, items: [] };
+      cat._flagsById.set(row.flag_id, flag);
+      cat.flags.push(flag);
+    }
+    if (row.item_id != null) {
+      flag.items.push({
+        id: row.item_id,
+        title: row.item_title,
+        image: row.item_image || null,
+      });
+    }
+  }
+
+  return Array.from(categoriesById.values()).map(({ _flagsById, ...rest }) => rest);
+}
+
 module.exports = {
   getAthleteMe,
   getAthleteMissions,
@@ -191,4 +238,5 @@ module.exports = {
   applyUnlockProgression,
   getFoodPrefs,
   upsertFoodPrefs,
+  getFoodPrefsCatalog,
 };
