@@ -161,9 +161,50 @@ async function listFoods({
   return { rows, total, limit: lim, offset: off };
 }
 
+// Read the flag taxonomy associations for a given item from `flag_item`. Used
+// when shaping a single-food response so the edit drawer can pre-select the
+// Sub Category dropdown.
+async function getFoodFlags(itemId) {
+  const r = await query(
+    `SELECT flag_id FROM public.flag_item WHERE item_id = $1`,
+    [itemId],
+  );
+  return r.rows.map((x) => Number(x.flag_id));
+}
+
+// Replace the full set of `flag_item` rows for an item. Called from create /
+// update so flag associations stay in sync with what the drawer submits.
+//
+// `flagIds` may be null/undefined (no change) or an array (authoritative new
+// set; an empty array clears all associations).
+async function syncFlagsForItem(itemId, flagIds) {
+  if (!Array.isArray(flagIds)) return;
+  const cleaned = Array.from(
+    new Set(
+      flagIds
+        .map((v) => Number(v))
+        .filter((v) => Number.isFinite(v) && v > 0),
+    ),
+  );
+
+  await query(`DELETE FROM public.flag_item WHERE item_id = $1`, [itemId]);
+  if (!cleaned.length) return;
+
+  // Bulk insert via UNNEST so we issue a single round-trip regardless of how
+  // many flags are selected.
+  await query(
+    `INSERT INTO public.flag_item (item_id, flag_id, created_at, updated_at)
+     SELECT $1, UNNEST($2::bigint[]), now(), now()`,
+    [itemId, cleaned],
+  );
+}
+
 async function getFoodById(id) {
   const result = await query(`SELECT * FROM public.items WHERE id = $1 LIMIT 1`, [id]);
-  return result.rows[0] ? shapeItem(result.rows[0]) : null;
+  if (!result.rows[0]) return null;
+  const shaped = shapeItem(result.rows[0]);
+  shaped.flag_ids = await getFoodFlags(shaped.id);
+  return shaped;
 }
 
 async function createFood(payload) {
@@ -209,7 +250,12 @@ async function createFood(payload) {
       payload.woolworth_json || null,
     ],
   );
-  return shapeItem(result.rows[0]);
+  const shaped = shapeItem(result.rows[0]);
+  if (Array.isArray(payload.flag_ids)) {
+    await syncFlagsForItem(shaped.id, payload.flag_ids);
+  }
+  shaped.flag_ids = await getFoodFlags(shaped.id);
+  return shaped;
 }
 
 async function updateFood(id, payload) {
@@ -247,13 +293,21 @@ async function updateFood(id, payload) {
   set("is_locked", payload.is_locked);
   set("category_id", payload.category_id);
 
-  if (!fields.length) return await getFoodById(id);
-  fields.push("updated_at = now()");
-  values.push(id);
-  await query(
-    `UPDATE public.items SET ${fields.join(", ")} WHERE id = $${i}`,
-    values,
-  );
+  // Only run the UPDATE if at least one items column actually changed; flag
+  // associations are handled separately below regardless.
+  if (fields.length) {
+    fields.push("updated_at = now()");
+    values.push(id);
+    await query(
+      `UPDATE public.items SET ${fields.join(", ")} WHERE id = $${i}`,
+      values,
+    );
+  }
+
+  if (Array.isArray(payload.flag_ids)) {
+    await syncFlagsForItem(id, payload.flag_ids);
+  }
+
   return await getFoodById(id);
 }
 
