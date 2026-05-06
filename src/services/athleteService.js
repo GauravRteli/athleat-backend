@@ -191,6 +191,7 @@ async function getFoodPrefsCatalog() {
        fc.name AS category_name,
        fl.id   AS flag_id,
        fl.name AS flag_name,
+       fl.emoji AS flag_emoji,
        i.id    AS item_id,
        i.title AS item_title,
        i.image AS item_image
@@ -215,7 +216,7 @@ async function getFoodPrefsCatalog() {
     }
     let flag = cat._flagsById.get(row.flag_id);
     if (!flag) {
-      flag = { id: row.flag_id, name: row.flag_name, items: [] };
+      flag = { id: row.flag_id, name: row.flag_name, emoji: row.flag_emoji || null, items: [] };
       cat._flagsById.set(row.flag_id, flag);
       cat.flags.push(flag);
     }
