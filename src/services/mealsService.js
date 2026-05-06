@@ -170,7 +170,7 @@ async function getMealById(id, client = null) {
   return shapeMeal(mealRes.rows[0], foods, categories, subCategories, tags);
 }
 
-async function listMeals({ category, search, limit = 200 } = {}) {
+async function listMeals({ category, categoryId, subCategoryId, search, limit = 200 } = {}) {
   const conditions = [];
   const params = [];
   if (search) {
@@ -184,6 +184,26 @@ async function listMeals({ category, search, limit = 200 } = {}) {
          SELECT 1 FROM public.meal_category mc
          JOIN public.food_categories fc ON fc.id = mc.category_id
          WHERE mc.meal_id = m.id AND fc.name = $${params.length}
+       )`,
+    );
+  }
+  // Filter by category id via the meal_category join table (UI dropdown).
+  if (categoryId) {
+    params.push(Number(categoryId));
+    conditions.push(
+      `EXISTS (
+         SELECT 1 FROM public.meal_category mc
+         WHERE mc.meal_id = m.id AND mc.category_id = $${params.length}
+       )`,
+    );
+  }
+  // Filter by sub-category id via the meal_sub_category join table.
+  if (subCategoryId) {
+    params.push(Number(subCategoryId));
+    conditions.push(
+      `EXISTS (
+         SELECT 1 FROM public.meal_sub_category msc
+         WHERE msc.meal_id = m.id AND msc.sub_category_id = $${params.length}
        )`,
     );
   }
@@ -302,35 +322,49 @@ async function ensureItemId(client, food) {
   throw new Error("ingredient must have item_id or food_name");
 }
 
+// Helper: clean an id array — coerce to numbers, drop nulls/dupes.
+function cleanIds(arr) {
+  if (!Array.isArray(arr)) return null;
+  return Array.from(
+    new Set(arr.map((v) => Number(v)).filter((n) => Number.isFinite(n) && n > 0)),
+  );
+}
+
 async function replaceMealJoins(client, mealId, payload) {
-  // Replace category join rows when the payload includes them.
-  if (Array.isArray(payload.category_ids)) {
+  // Each block: one DELETE + one bulk INSERT via UNNEST. Cuts ~2N round-trips
+  // down to a constant 6 (DELETE + INSERT × 3 join tables) regardless of how
+  // many categories / sub-categories / tags are attached.
+  const cats = cleanIds(payload.category_ids);
+  const subs = cleanIds(payload.sub_category_ids);
+  const tagIds = cleanIds(payload.tag_ids);
+
+  if (cats !== null) {
     await client.query("DELETE FROM public.meal_category WHERE meal_id = $1", [mealId]);
-    for (const cid of payload.category_ids) {
-      if (cid == null) continue;
+    if (cats.length) {
       await client.query(
-        "INSERT INTO public.meal_category (meal_id, category_id) VALUES ($1,$2)",
-        [mealId, Number(cid)],
+        `INSERT INTO public.meal_category (meal_id, category_id)
+         SELECT $1, UNNEST($2::bigint[])`,
+        [mealId, cats],
       );
     }
   }
-  if (Array.isArray(payload.sub_category_ids)) {
+  if (subs !== null) {
     await client.query("DELETE FROM public.meal_sub_category WHERE meal_id = $1", [mealId]);
-    for (const sid of payload.sub_category_ids) {
-      if (sid == null) continue;
+    if (subs.length) {
       await client.query(
-        "INSERT INTO public.meal_sub_category (meal_id, sub_category_id) VALUES ($1,$2)",
-        [mealId, Number(sid)],
+        `INSERT INTO public.meal_sub_category (meal_id, sub_category_id)
+         SELECT $1, UNNEST($2::bigint[])`,
+        [mealId, subs],
       );
     }
   }
-  if (Array.isArray(payload.tag_ids)) {
+  if (tagIds !== null) {
     await client.query("DELETE FROM public.meal_tag WHERE meal_id = $1", [mealId]);
-    for (const tid of payload.tag_ids) {
-      if (tid == null) continue;
+    if (tagIds.length) {
       await client.query(
-        "INSERT INTO public.meal_tag (meal_id, tag_id) VALUES ($1,$2)",
-        [mealId, Number(tid)],
+        `INSERT INTO public.meal_tag (meal_id, tag_id)
+         SELECT $1, UNNEST($2::bigint[])`,
+        [mealId, tagIds],
       );
     }
   }
@@ -382,41 +416,102 @@ async function resolveIngredientMacros(client, food, itemId) {
   };
 }
 
+// ── Helpers used by the fast-path bulk insert below. ───────────────────────
+function ingredientWeightStr(f) {
+  if (f.weight_g != null) return String(num(f.weight_g));
+  if (f.weight_grams != null) return String(num(f.weight_grams));
+  if (f.qty != null) return String(f.qty);
+  return null;
+}
+
+function ingredientSelectedUnit(f) {
+  if (!f.selected_qty_unit) return null;
+  return typeof f.selected_qty_unit === "string"
+    ? f.selected_qty_unit
+    : JSON.stringify(f.selected_qty_unit);
+}
+
+// Quick check: payload supplies an explicit item_id and complete macros, so
+// we can skip the per-row SELECT/INSERT dance in `ensureItemId` /
+// `resolveIngredientMacros` and emit one bulk INSERT.
+function canFastInsertIngredient(f) {
+  const idOk = (f.item_id || f.food_id || f.id) != null;
+  const macrosOk =
+    f.protein_g != null &&
+    f.carb_g != null &&
+    f.fat_g != null &&
+    f.energy_kj != null;
+  return idOk && macrosOk;
+}
+
+// Bulk-insert all ingredients in one round-trip when every row qualifies.
+// Uses parallel arrays + UNNEST so any list size is a single statement.
+async function bulkInsertItemMeals(client, mealId, foods, idOverrides = null) {
+  if (!foods.length) return;
+  const itemIds = foods.map((f, i) => Number(idOverrides?.[i] ?? f.item_id ?? f.food_id ?? f.id));
+  const orders  = foods.map((_f, i) => i);
+  const qtys    = foods.map((f) => ingredientWeightStr(f));
+  const units   = foods.map((f) => f.unit || f.weight_unit || "g");
+  const carbs   = foods.map((f) => num(f.carb_g) ?? 0);
+  const prots   = foods.map((f) => num(f.protein_g) ?? 0);
+  const fats    = foods.map((f) => num(f.fat_g) ?? 0);
+  const energies = foods.map((f) => (f.energy_kj != null ? `${num(f.energy_kj)}kJ` : null));
+  const selUnits = foods.map((f) => ingredientSelectedUnit(f));
+
+  await client.query(
+    `INSERT INTO public.item_meals
+       (item_id, meal_id, "order", item_qty, item_qty_unit,
+        carbs, protein, fat, energy, selected_qty_unit)
+     SELECT iid, $1, ord, qty, unit, c, p, f, e, to_jsonb(sel)
+     FROM UNNEST(
+       $2::bigint[],
+       $3::int[],
+       $4::text[],
+       $5::text[],
+       $6::numeric[],
+       $7::numeric[],
+       $8::numeric[],
+       $9::text[],
+       $10::text[]
+     ) AS u(iid, ord, qty, unit, c, p, f, e, sel)`,
+    [mealId, itemIds, orders, qtys, units, carbs, prots, fats, energies, selUnits],
+  );
+}
+
+// Replace the meal's ingredient rows. Fast path: when every food carries an
+// explicit item_id and macros (the LibraryPanel save flow), one DELETE + one
+// bulk INSERT covers everything. Slow path falls back to the original
+// per-row resolve loop for legacy callers (V3 carousel / AI) that may pass
+// `food_name` only.
 async function replaceMealFoods(client, mealId, foods) {
   await client.query("DELETE FROM public.item_meals WHERE meal_id = $1", [mealId]);
+  if (!foods.length) return;
+
+  if (foods.every(canFastInsertIngredient)) {
+    await bulkInsertItemMeals(client, mealId, foods);
+    return;
+  }
+
+  // Slow path — resolve per-row, but still emit a single bulk INSERT at the
+  // end so we only pay one round-trip for the actual write.
+  const resolvedItemIds = [];
+  for (const f of foods) {
+    resolvedItemIds.push(await ensureItemId(client, f));
+  }
+  // Fill any missing macros using the items table (per-serving × ratio).
+  const filledFoods = [];
   for (let i = 0; i < foods.length; i++) {
     const f = foods[i];
-    const itemId = await ensureItemId(client, f);
-    const macros = await resolveIngredientMacros(client, f, itemId);
-    await client.query(
-      `INSERT INTO public.item_meals
-         (item_id, meal_id, "order", item_qty, item_qty_unit,
-          carbs, protein, fat, energy, selected_qty_unit)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [
-        itemId,
-        mealId,
-        i,
-        f.weight_g != null
-          ? String(num(f.weight_g))
-          : f.weight_grams != null
-          ? String(num(f.weight_grams))
-          : f.qty != null
-          ? String(f.qty)
-          : null,
-        f.unit || f.weight_unit || "g",
-        macros.carbs != null ? macros.carbs : 0,
-        macros.protein != null ? macros.protein : 0,
-        macros.fat != null ? macros.fat : 0,
-        macros.energyKj != null ? `${macros.energyKj}kJ` : null,
-        f.selected_qty_unit
-          ? typeof f.selected_qty_unit === "string"
-            ? f.selected_qty_unit
-            : JSON.stringify(f.selected_qty_unit)
-          : null,
-      ],
-    );
+    const macros = await resolveIngredientMacros(client, f, resolvedItemIds[i]);
+    filledFoods.push({
+      ...f,
+      protein_g: macros.protein != null ? macros.protein : 0,
+      carb_g: macros.carbs != null ? macros.carbs : 0,
+      fat_g: macros.fat != null ? macros.fat : 0,
+      energy_kj: macros.energyKj != null ? macros.energyKj : null,
+    });
   }
+  await bulkInsertItemMeals(client, mealId, filledFoods, resolvedItemIds);
 }
 
 async function createMeal(payload) {
@@ -441,8 +536,11 @@ async function createMeal(payload) {
     if (foods.length) await replaceMealFoods(client, meal.id, foods);
     await replaceMealJoins(client, meal.id, payload);
 
+    // Hydrate inside the same transaction to avoid a fresh pool connection
+    // (and a window where the new meal isn't yet visible to other readers).
+    const shaped = await getMealById(meal.id, client);
     await client.query("COMMIT");
-    return await getMealById(meal.id);
+    return shaped;
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
@@ -492,8 +590,10 @@ async function updateMeal(id, payload) {
     }
     await replaceMealJoins(client, id, payload);
 
+    // Hydrate inside the same transaction (saves a connection acquire).
+    const shaped = await getMealById(id, client);
     await client.query("COMMIT");
-    return await getMealById(id);
+    return shaped;
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;

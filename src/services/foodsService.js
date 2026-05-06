@@ -137,7 +137,7 @@ async function listFoods({
          FROM public.items
          ${joinClause}
          ${where}
-        ORDER BY items.title ASC
+        ORDER BY items.created_at DESC NULLS LAST, items.id DESC
         LIMIT $${limIdx} OFFSET $${offIdx}`,
       params,
     );
@@ -147,7 +147,7 @@ async function listFoods({
       `SELECT ${selectClause}, COUNT(*) OVER() AS __total
          FROM public.items
          ${where}
-        ORDER BY items.title ASC
+        ORDER BY items.created_at DESC NULLS LAST, items.id DESC
         LIMIT $${limIdx} OFFSET $${offIdx}`,
       params,
     );

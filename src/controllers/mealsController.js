@@ -10,6 +10,8 @@ async function getAll(req, res, next) {
   try {
     const data = await listMeals({
       category: req.query.category || undefined,
+      categoryId: req.query.category_id || undefined,
+      subCategoryId: req.query.sub_category_id || undefined,
       search: req.query.search || undefined,
     });
     return res.status(200).json({ data });
