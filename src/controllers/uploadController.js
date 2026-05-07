@@ -1,4 +1,4 @@
-const { uploadImage } = require("../services/uploadService");
+const { uploadImage, uploadFile } = require("../services/uploadService");
 
 async function postImage(req, res, next) {
   try {
@@ -13,4 +13,17 @@ async function postImage(req, res, next) {
   }
 }
 
-module.exports = { postImage };
+async function postFile(req, res, next) {
+  try {
+    const { file, filename, folder } = req.body;
+    if (!file) {
+      return res.status(400).json({ message: "file (base64 data-url) is required" });
+    }
+    const result = await uploadFile(file, { filename, folder });
+    return res.status(200).json(result);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+module.exports = { postImage, postFile };

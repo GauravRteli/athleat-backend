@@ -10,8 +10,13 @@ function shape(row) {
     content: row.content,
     wrong_answer: row.wrong_answer,
     right_answer: row.right_answer,
+    folder_id: row.folder_id,
     file_name: row.file_name,
     file_url: row.file_url,
+    file_public_id: row.file_public_id,
+    file_size: row.file_size,
+    file_size_bytes: row.file_size_bytes != null ? Number(row.file_size_bytes) : null,
+    file_type: row.file_type,
     is_active: row.is_active,
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -32,8 +37,10 @@ async function createKnowledgeEntry(payload) {
   }
   const result = await query(
     `INSERT INTO public.knowledge_entries
-      (type, category, content, wrong_answer, right_answer, file_name, file_url, is_active)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, true))
+      (type, category, content, wrong_answer, right_answer,
+       folder_id, file_name, file_url, file_public_id,
+       file_size, file_size_bytes, file_type, is_active)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, COALESCE($13, true))
      RETURNING *`,
     [
       payload.type,
@@ -41,8 +48,13 @@ async function createKnowledgeEntry(payload) {
       payload.content || null,
       payload.wrong_answer || null,
       payload.right_answer || null,
+      payload.folder_id || null,
       payload.file_name || null,
       payload.file_url || null,
+      payload.file_public_id || null,
+      payload.file_size || null,
+      payload.file_size_bytes != null ? Number(payload.file_size_bytes) : null,
+      payload.file_type || null,
       payload.is_active,
     ],
   );
@@ -53,7 +65,11 @@ async function updateKnowledgeEntry(id, payload) {
   const fields = [];
   const values = [];
   let i = 1;
-  ["category", "content", "wrong_answer", "right_answer", "file_name", "file_url", "is_active"].forEach((f) => {
+  [
+    "category", "content", "wrong_answer", "right_answer",
+    "folder_id", "file_name", "file_url", "file_public_id",
+    "file_size", "file_size_bytes", "file_type", "is_active",
+  ].forEach((f) => {
     if (payload[f] !== undefined) {
       fields.push(`${f} = $${i++}`);
       values.push(payload[f]);
