@@ -24,6 +24,25 @@ const env = {
     jwtSecret: process.env.JWT_SECRET || "",
     jwtExpiresIn: process.env.JWT_EXPIRES_IN || "30d",
   },
+  openai: {
+    apiKey: process.env.OPENAI_API_KEY || "",
+    embeddingModel: process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-large",
+    chatModel: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
+    visionModel: process.env.OPENAI_VISION_MODEL || "gpt-4o-mini",
+  },
+  pinecone: {
+    apiKey: process.env.PINECONE_API_KEY || "",
+    indexName: process.env.PINECONE_INDEX || "athleat-knowledge",
+    cloud: process.env.PINECONE_CLOUD || "aws",
+    region: process.env.PINECONE_REGION || "us-east-1",
+    dimension: Number(process.env.PINECONE_DIMENSION || 3072),
+  },
+  rag: {
+    chunkSize: Number(process.env.RAG_CHUNK_SIZE || 800),
+    chunkOverlap: Number(process.env.RAG_CHUNK_OVERLAP || 100),
+    topK: Number(process.env.RAG_TOP_K || 6),
+    maxHistoryTurns: Number(process.env.RAG_MAX_HISTORY_TURNS || 10),
+  },
 };
 
 module.exports = env;

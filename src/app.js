@@ -17,7 +17,15 @@ app.use(
   }),
 );
 app.use(express.json({ limit: "50mb" }));
-app.use(morgan("dev"));
+// Skip the chatty knowledge-entries polling endpoint from the request log so
+// the [rag][indexer …] tracking lines stay readable. Other endpoints log
+// normally.
+app.use(
+  morgan("dev", {
+    skip: (req) =>
+      req.method === "GET" && req.originalUrl.startsWith("/api/knowledge-entries"),
+  }),
+);
 
 app.get("/", (req, res) => {
   res.json({

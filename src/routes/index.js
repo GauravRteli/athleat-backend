@@ -11,6 +11,7 @@ const mealsRoutes = require("./mealsRoutes");
 const foodsRoutes = require("./foodsRoutes");
 const libraryRoutes = require("./libraryRoutes");
 const eerConfigRoutes = require("./eerConfigRoutes");
+const chatRoutes = require("./chatRoutes");
 
 const router = express.Router();
 
@@ -26,5 +27,6 @@ router.use("/meals", mealsRoutes);
 router.use("/foods", foodsRoutes);
 router.use("/library", libraryRoutes);
 router.use("/eer-config", eerConfigRoutes);
+router.use("/chat", chatRoutes);
 
 module.exports = router;
