@@ -7,7 +7,8 @@
 //     batch under 100 to stay well within the 300K token-per-request limit)
 //   • light retry on transient 429 / 5xx
 //   • passes `dimensions` from env so the embedding output width matches the
-//     Pinecone index (e.g. 1024 vs the model's default 3072)
+//     `vector(N)` column in knowledge_chunks (default 1024 vs the model's
+//     native 3072 for text-embedding-3-large)
 //
 // The shape returned by `embedBatch` is a parallel array of float vectors
 // matching the order of the input strings.
@@ -42,7 +43,7 @@ const NATIVE_DIMS = {
 
 function targetDimension() {
   const native = NATIVE_DIMS[env.openai.embeddingModel] || null;
-  const target = Number(env.pinecone.dimension) || null;
+  const target = Number(env.rag.vectorDimension) || null;
   if (!target) return null;
   if (native && native === target) return null;
   return target;

@@ -1,9 +1,9 @@
-// Indexer — turns a knowledge_entry row into Pinecone vectors.
+// Indexer — turns a knowledge_entry row into pgvector chunks.
 //
 // Public surface:
 //   indexEntry(entry, { force })   — extract → chunk → embed → upsert
 //   indexEntryAsync(entry, opts)   — fire-and-forget version (used by HTTP)
-//   removeEntry(id)                — delete every vector for one entry
+//   removeEntry(id)                — delete every chunk for one entry
 //   removeEntryAsync(id)           — fire-and-forget version
 //   reindexEntryById(id, opts)     — load row + indexEntry (manual retry)
 //
@@ -22,7 +22,7 @@ const { query } = require("../../config/postgres");
 const { extractFromUrl } = require("./extractor");
 const { chunkText } = require("./chunker");
 const { embedBatch, targetDimension } = require("./embeddings");
-const pinecone = require("./pinecone");
+const vectorStore = require("./vectorStore");
 const env = require("../../config/env");
 const log = require("./log").tag("indexer");
 
@@ -31,7 +31,9 @@ const log = require("./log").tag("indexer");
 const STALE_PROCESSING_MS = 10 * 60 * 1000; // 10 minutes
 
 function ragEnabled() {
-  return Boolean(env.openai.apiKey && env.pinecone.apiKey);
+  // Vector store lives in Supabase Postgres now — the only external dep
+  // is OpenAI for embeddings + chat completions.
+  return Boolean(env.openai.apiKey);
 }
 
 // Atomically claim the row for indexing. Returns the claimed row, or null if
@@ -115,7 +117,7 @@ function describe(entry) {
 async function indexEntry(entryInput, { force = false } = {}) {
   if (!entryInput?.id) return { skipped: true, reason: "no-id" };
   if (!ragEnabled()) {
-    log.warn("rag disabled — skipping (OPENAI_API_KEY/PINECONE_API_KEY missing)", { id: entryInput.id });
+    log.warn("rag disabled — skipping (OPENAI_API_KEY missing)", { id: entryInput.id });
     return { skipped: true, reason: "rag-disabled" };
   }
 
@@ -148,7 +150,7 @@ async function indexEntry(entryInput, { force = false } = {}) {
 
     if (!text) {
       log.warn("no extractable text — marking ready (no chunks)", { id: entry.id });
-      await pinecone.deleteByEntry(entry.id).catch(() => {});
+      await vectorStore.deleteByEntry(entry.id).catch(() => {});
       await setReady(entry.id);
       return { skipped: false, chunks: 0, total_ms: stop() };
     }
@@ -157,7 +159,7 @@ async function indexEntry(entryInput, { force = false } = {}) {
     const chunks = chunkText(text);
     log.info("chunk done", { id: entry.id, chunks: chunks.length });
     if (!chunks.length) {
-      await pinecone.deleteByEntry(entry.id).catch(() => {});
+      await vectorStore.deleteByEntry(entry.id).catch(() => {});
       await setReady(entry.id);
       return { skipped: false, chunks: 0, total_ms: stop() };
     }
@@ -173,15 +175,15 @@ async function indexEntry(entryInput, { force = false } = {}) {
     const vectors = await embedBatch(chunks);
     log.info("embed done", { id: entry.id, vectors: vectors.length, took_ms: tEmbed() });
 
-    // 4. Replace any prior vectors for this entry
+    // 4. Replace any prior chunks for this entry
     const tDel = log.timer();
-    await pinecone.deleteByEntry(entry.id);
-    log.info("pinecone wipe", { id: entry.id, took_ms: tDel() });
+    await vectorStore.deleteByEntry(entry.id);
+    log.info("pgvector wipe", { id: entry.id, took_ms: tDel() });
 
     // 5. Upsert fresh
     const tUp = log.timer();
-    await pinecone.upsertChunks(entry, chunks, vectors);
-    log.info("pinecone upsert", { id: entry.id, vectors: vectors.length, took_ms: tUp() });
+    await vectorStore.upsertChunks(entry, chunks, vectors);
+    log.info("pgvector upsert", { id: entry.id, chunks: chunks.length, took_ms: tUp() });
 
     // 6. Mark ready
     await setReady(entry.id);
@@ -202,10 +204,13 @@ function indexEntryAsync(entry, opts) {
 
 async function removeEntry(entryId) {
   if (!entryId) return;
-  if (!ragEnabled()) return;
+  // Note: this is a defence-in-depth call.  The knowledge_chunks FK has
+  // ON DELETE CASCADE, so deleting the parent row in
+  // knowledge_entries already wipes its chunks.  We still call this to
+  // cover soft-delete flows that flip is_active without removing the row.
   const stop = log.timer();
   try {
-    await pinecone.deleteByEntry(entryId);
+    await vectorStore.deleteByEntry(entryId);
     log.info("removeEntry", { id: entryId, took_ms: stop() });
   } catch (err) {
     log.error("removeEntry failed", { id: entryId, took_ms: stop() }, err);

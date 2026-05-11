@@ -1,6 +1,8 @@
+const path = require("path");
 const dotenv = require("dotenv");
 
-dotenv.config();
+// Load `.env` from `backend/` even if the process cwd is the repo root.
+dotenv.config({ path: path.join(__dirname, "../../.env") });
 
 const env = {
   nodeEnv: process.env.NODE_ENV || "development",
@@ -16,9 +18,12 @@ const env = {
     password: process.env.SUPABASE_DB_PASSWORD,
     ssl: process.env.SUPABASE_DB_SSL === "true",
   },
+  // Optional REST keys (unused by Virtual Kez — Kez talks to Postgres via `DATABASE_URL`/pool.)
   supabaseApi: {
-    url: process.env.SUPABASE_URL,
-    serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    url: String(process.env.SUPABASE_URL || "").trim(),
+    serviceRoleKey: String(
+      process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY || "",
+    ).trim(),
   },
   auth: {
     jwtSecret: process.env.JWT_SECRET || "",
@@ -30,18 +35,19 @@ const env = {
     chatModel: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
     visionModel: process.env.OPENAI_VISION_MODEL || "gpt-4o-mini",
   },
-  pinecone: {
-    apiKey: process.env.PINECONE_API_KEY || "",
-    indexName: process.env.PINECONE_INDEX || "athleat-knowledge",
-    cloud: process.env.PINECONE_CLOUD || "aws",
-    region: process.env.PINECONE_REGION || "us-east-1",
-    dimension: Number(process.env.PINECONE_DIMENSION || 3072),
+  anthropic: {
+    apiKey: process.env.ANTHROPIC_API_KEY || "",
+    model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
   },
   rag: {
     chunkSize: Number(process.env.RAG_CHUNK_SIZE || 800),
     chunkOverlap: Number(process.env.RAG_CHUNK_OVERLAP || 100),
     topK: Number(process.env.RAG_TOP_K || 6),
     maxHistoryTurns: Number(process.env.RAG_MAX_HISTORY_TURNS || 10),
+    // Width of each embedding written into knowledge_chunks.embedding.
+    // Must match the `vector(N)` column dim in the pgvector migration —
+    // changing it requires dropping & recreating the table.
+    vectorDimension: Number(process.env.RAG_VECTOR_DIMENSION || 1024),
   },
 };
 

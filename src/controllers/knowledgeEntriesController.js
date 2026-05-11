@@ -5,7 +5,7 @@ const {
   deleteKnowledgeEntry,
 } = require("../services/knowledgeEntriesService");
 const indexer = require("../services/rag/indexer");
-const pinecone = require("../services/rag/pinecone");
+const vectorStore = require("../services/rag/vectorStore");
 const { runBackfillAsync } = require("../services/rag/backfill");
 const { query } = require("../config/postgres");
 
@@ -70,15 +70,15 @@ async function reindexEntry(req, res, next) {
   }
 }
 
-// Admin: wipe ALL vectors from Pinecone and re-embed every active entry.
-// Files in Cloudinary and rows in Postgres are not touched. We do the wipe
-// + status reset SYNCHRONOUSLY so the response can report `{ queued: N }`
-// and the frontend's status poll immediately sees rows flip to 'pending'.
-// The actual re-embedding runs in the background.
+// Admin: wipe ALL chunks from pgvector (knowledge_chunks) and re-embed every
+// active entry.  Files in Cloudinary and rows in Postgres are not touched.
+// We do the wipe + status reset SYNCHRONOUSLY so the response can report
+// `{ queued: N }` and the frontend's status poll immediately sees rows flip
+// to 'pending'.  The actual re-embedding runs in the background.
 async function reindexAll(req, res, next) {
   try {
-    // 1. Wipe every vector in the configured index.
-    await pinecone.deleteAllVectors();
+    // 1. Truncate the chunk table.
+    await vectorStore.deleteAllVectors();
 
     // 2. Reset every active row to pending so the next poll shows progress.
     const result = await query(

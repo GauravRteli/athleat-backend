@@ -4,7 +4,8 @@
 // `topK`, this:
 //   1. trims to last N turns (env.rag.maxHistoryTurns)
 //   2. embeds the latest user message
-//   3. queries Pinecone for the top-K matching chunks
+//   3. queries Supabase pgvector (match_knowledge_chunks RPC) for the top-K
+//      matching chunks
 //   4. builds a system prompt that injects those chunks as CONTEXT
 //   5. calls OpenAI chat completions
 //   6. returns { answer, sources }
@@ -14,7 +15,7 @@
 const OpenAI = require("openai");
 const env = require("../../config/env");
 const { embedQuery } = require("./embeddings");
-const pinecone = require("./pinecone");
+const vectorStore = require("./vectorStore");
 const log = require("./log").tag("chat");
 
 let _client = null;
@@ -91,9 +92,6 @@ async function chatTurn({ messages, topK }) {
   if (!env.openai.apiKey) {
     throw Object.assign(new Error("OpenAI API key not configured"), { status: 503 });
   }
-  if (!env.pinecone.apiKey) {
-    throw Object.assign(new Error("Pinecone API key not configured"), { status: 503 });
-  }
 
   const trimmed = trimHistory(messages, env.rag.maxHistoryTurns);
   const userQ = lastUser(trimmed);
@@ -110,7 +108,7 @@ async function chatTurn({ messages, topK }) {
   log.info("query embedded", { dim: queryVector.length, took_ms: tEmbed() });
 
   const tQ = log.timer();
-  const matches = await pinecone.query({ vector: queryVector, topK: k });
+  const matches = await vectorStore.query({ vector: queryVector, topK: k });
   const top = matches[0]?.score ?? null;
   const bot = matches[matches.length - 1]?.score ?? null;
   log.info("retrieved", {

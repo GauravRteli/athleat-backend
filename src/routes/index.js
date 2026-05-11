@@ -12,21 +12,24 @@ const foodsRoutes = require("./foodsRoutes");
 const libraryRoutes = require("./libraryRoutes");
 const eerConfigRoutes = require("./eerConfigRoutes");
 const chatRoutes = require("./chatRoutes");
+const kezRoutes = require("./kezRoutes");
+const { requireDashboardAuth } = require("../middleware/auth");
 
 const router = express.Router();
 
 router.use("/health", healthRoutes);
 router.use("/auth", authRoutes);
 router.use("/athlete", athleteRoutes);
-router.use("/students", studentRoutes);
-router.use("/mission-config", missionConfigRoutes);
-router.use("/uploads", uploadRoutes);
-router.use("/knowledge-entries", knowledgeEntriesRoutes);
-router.use("/knowledge-folders", knowledgeFoldersRoutes);
-router.use("/meals", mealsRoutes);
-router.use("/foods", foodsRoutes);
+router.use("/students", requireDashboardAuth, studentRoutes);
+router.use("/mission-config", requireDashboardAuth, missionConfigRoutes);
+router.use("/uploads", requireDashboardAuth, uploadRoutes);
+router.use("/knowledge-entries", requireDashboardAuth, knowledgeEntriesRoutes);
+router.use("/knowledge-folders", requireDashboardAuth, knowledgeFoldersRoutes);
+router.use("/meals", requireDashboardAuth, mealsRoutes);
+router.use("/foods", requireDashboardAuth, foodsRoutes);
 router.use("/library", libraryRoutes);
-router.use("/eer-config", eerConfigRoutes);
-router.use("/chat", chatRoutes);
+router.use("/eer-config", requireDashboardAuth, eerConfigRoutes);
+router.use("/chat", requireDashboardAuth, chatRoutes);
+router.use("/kez", requireDashboardAuth, kezRoutes);
 
 module.exports = router;

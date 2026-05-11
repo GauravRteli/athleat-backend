@@ -1,7 +1,7 @@
 const app = require("./app");
 const env = require("./config/env");
 const { pool } = require("./config/postgres");
-const pinecone = require("./services/rag/pinecone");
+const vectorStore = require("./services/rag/vectorStore");
 const { runBackfillAsync } = require("./services/rag/backfill");
 
 async function bootstrap() {
@@ -12,17 +12,15 @@ async function bootstrap() {
     console.error("Initial DB connection failed:", error.message);
   }
 
-  let pineconeReady = false;
-  if (env.pinecone.apiKey) {
-    try {
-      pineconeReady = await pinecone.ensureIndex();
-    } catch (error) {
-      console.error("Initial Pinecone init failed:", error.message);
-    }
-  } else {
-    console.warn(
-      "[startup] PINECONE_API_KEY missing — RAG indexing disabled until set."
-    );
+  // Verify pgvector + knowledge_chunks table are present.  This is cheap
+  // (two metadata queries) so we always run it; missing extension/table
+  // means the operator forgot to apply the migration and we should warn
+  // loudly rather than fail later on the first upsert.
+  let storeReady = false;
+  try {
+    storeReady = await vectorStore.ensureIndex();
+  } catch (error) {
+    console.error("Initial pgvector init failed:", error.message);
   }
 
   // Start the HTTP listener first so health checks succeed immediately, then
@@ -32,7 +30,7 @@ async function bootstrap() {
     console.log(`Backend listening on http://localhost:${env.port}`);
   });
 
-  if (pineconeReady && env.openai.apiKey) {
+  if (storeReady && env.openai.apiKey) {
     runBackfillAsync();
   }
 }

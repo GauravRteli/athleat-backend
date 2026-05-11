@@ -4,7 +4,7 @@ const indexer = require("./rag/indexer");
 const VALID_TYPES = ["knowledge", "correction", "never", "file"];
 
 // Fields that change the *content* of an entry. Touching any of these requires
-// the Pinecone vectors to be rebuilt; touching anything else (folder_id move,
+// the chunk embeddings to be rebuilt; touching anything else (folder_id move,
 // is_active flip, file_size cosmetic, embedding bookkeeping) does not.
 const CONTENT_FIELDS = new Set([
   "content",
@@ -122,8 +122,9 @@ async function deleteKnowledgeEntry(id) {
     `UPDATE public.knowledge_entries SET is_active = false, updated_at = now() WHERE id = $1`,
     [id],
   );
-  // Pinecone removal is async/best-effort — vectors disappear after the call,
-  // but we don't fail the soft-delete if the vector store is down.
+  // Vector cleanup is async/best-effort — the chunks disappear after the
+  // call, but we don't fail the soft-delete if the vector store is down.
+  // (Hard deletes also cascade via the FK in knowledge_chunks.)
   indexer.removeEntryAsync(id);
 }
 

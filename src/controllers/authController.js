@@ -1,4 +1,5 @@
 const { signupAthlete, loginAthlete } = require("../services/authService");
+const { loginDashboard, changeDashboardPassword } = require("../services/dashboardAuthService");
 
 async function postSignup(req, res, next) {
   try {
@@ -40,8 +41,36 @@ function postForgotPassword(req, res) {
   });
 }
 
+async function postDashboardLogin(req, res, next) {
+  try {
+    const password = String(req.body?.password || "");
+    const result = await loginDashboard({ password });
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+function getDashboardSession(req, res) {
+  return res.status(200).json({ ok: true });
+}
+
+async function postDashboardPassword(req, res, next) {
+  try {
+    const password = String(req.body?.password || "");
+    const confirmPassword = String(req.body?.confirmPassword || "");
+    const result = await changeDashboardPassword({ password, confirmPassword });
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   postSignup,
   postLogin,
   postForgotPassword,
+  postDashboardLogin,
+  getDashboardSession,
+  postDashboardPassword,
 };

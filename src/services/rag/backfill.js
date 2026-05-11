@@ -3,8 +3,8 @@
 // Goals:
 //   1. Reset any rows wedged in `processing` after a previous crash to
 //      `pending` so they get retried.
-//   2. Find every active row in the knowledge base whose vectors aren't in
-//      Pinecone yet (status `pending` or `failed`) and run `indexEntry` on
+//   2. Find every active row in the knowledge base whose chunks aren't in
+//      pgvector yet (status `pending` or `failed`) and run `indexEntry` on
 //      each, with a small concurrency cap so we don't blast the OpenAI rate
 //      limit on a cold start with hundreds of files.
 //
@@ -13,7 +13,7 @@
 
 const { query } = require("../../config/postgres");
 const { indexEntry, ragEnabled } = require("./indexer");
-const pinecone = require("./pinecone");
+const vectorStore = require("./vectorStore");
 const log = require("./log").tag("backfill");
 
 const DEFAULT_CONCURRENCY = 2;
@@ -64,7 +64,7 @@ async function runWithConcurrency(items, worker, concurrency) {
 
 async function runBackfill({ concurrency = DEFAULT_CONCURRENCY } = {}) {
   if (!ragEnabled()) {
-    log.warn("rag disabled — skipping backfill (OPENAI_API_KEY/PINECONE_API_KEY missing)");
+    log.warn("rag disabled — skipping backfill (OPENAI_API_KEY missing)");
     return { reset: 0, total: 0, ok: 0, failed: 0, skipped: 0 };
   }
   const stop = log.timer();
@@ -110,9 +110,9 @@ function runBackfillAsync(opts) {
     .catch((err) => log.error("backfill swallowed", null, err));
 }
 
-// Admin "rebuild everything" flow — wipes the entire Pinecone index, resets
-// every active row's status to `pending`, then runs the normal backfill which
-// re-extracts + re-embeds + re-upserts every entry.
+// Admin "rebuild everything" flow — TRUNCATEs the knowledge_chunks table,
+// resets every active row's status to `pending`, then runs the normal
+// backfill which re-extracts + re-embeds + re-upserts every entry.
 //
 // Files in Cloudinary and rows in Postgres are NOT deleted — only the vector
 // store is rebuilt from the source of truth.
@@ -121,17 +121,17 @@ function runBackfillAsync(opts) {
 // the client; the actual indexing happens in the background.
 async function reindexAll({ concurrency = DEFAULT_CONCURRENCY } = {}) {
   if (!ragEnabled()) {
-    log.warn("rag disabled — cannot reindex (OPENAI_API_KEY/PINECONE_API_KEY missing)");
+    log.warn("rag disabled — cannot reindex (OPENAI_API_KEY missing)");
     return { ok: false, reason: "rag-disabled" };
   }
   const stop = log.timer();
-  log.info("REINDEX-ALL start — wiping Pinecone");
+  log.info("REINDEX-ALL start — wiping pgvector");
 
-  // 1. wipe vectors
+  // 1. wipe chunks
   try {
-    await pinecone.deleteAllVectors();
+    await vectorStore.deleteAllVectors();
   } catch (err) {
-    log.error("REINDEX-ALL pinecone wipe failed — aborting", null, err);
+    log.error("REINDEX-ALL pgvector wipe failed — aborting", null, err);
     throw err;
   }
 

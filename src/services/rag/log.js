@@ -3,7 +3,7 @@
 // Output looks like:
 //   [rag][indexer 14:32:09.123] claim id=abc-123 file=foo.pdf
 //
-// Each tag (indexer / chat / pinecone / extract / embed / backfill) gets its
+// Each tag (indexer / chat / pgvector / extract / embed / backfill) gets its
 // own bound logger via `tag()` so call-sites stay terse:
 //
 //   const log = require("./log").tag("indexer");
