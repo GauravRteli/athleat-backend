@@ -1,0 +1,237 @@
+================================================================================
+ATHLEAT — V3 MEAL CAROUSEL: WHAT GOES INTO THE LLM PROMPT (AND A SAMPLE LAYOUT)
+================================================================================
+Generated for developers. Source files:
+  • System + brain: backend/src/services/kez/composer.js + masterPrompt.js
+  • User message + catalog: backend/src/controllers/kezController.js (mealCarouselPost)
+  • LLM call: backend/src/services/kez/llm.js
+
+--------------------------------------------------------------------------------
+1) FOOD DETAILS SHARED IN THE PROMPT
+--------------------------------------------------------------------------------
+
+A) VERIFIED MEALS SUMMARY (text lines — NOT full meal objects)
+   Built in kezController.js from the top-scored DB meals (legacy meals stack).
+   One line per suggested verified card, format:
+     "- {title}: P {protein}g C {carbs}g F {fat}g {energy_kj}kJ"
+   Example:
+     "- Chicken rice bowl: P 35g C 72g F 12g 2850kJ"
+     "- Greek yoghurt parfait: P 18g C 45g F 8g 1650kJ"
+   The LLM does NOT receive the full ingredient list for these lines — only
+   title + rounded macro totals + kJ.
+
+B) ITEMS CATALOG (bulk of tokens when Kez must "gap fill" AI meals)
+   Built by buildItemsCatalog() in kezController.js from public.items:
+     • FOOD CATEGORIES — comma-separated id|name for up to 200 rows from
+       public.food_categories
+     • FOOD SUB-CATEGORIES — comma-separated id|title for up to 200 rows from
+       public.sub_categories
+     • ITEMS table — up to hardLimit rows (default 1000 in code), each line:
+         id | title | category | protein | carbs | fat | kJ | serving
+       (pipe-separated; kJ parsed from items.energy; serving from serving_size
+       + serving_size_unit)
+   Only rows where is_locked = false. Ordered by category, title. If the
+   joined text exceeds maxChars (default 60_000), lines are dropped from the
+   tail until under budget (minimum ~200 lines kept in the shrink loop).
+
+C) ATHLETE PREFERENCES (not per-item rows, but text lists inside FACTS JSON)
+   • liked_foods — merged DB preferences + coach-typed list from the request
+   • dislikes — derived from prescreen (dislike_foods etc.)
+   These steer which catalog lines the model should favour or avoid; they are
+   not a second copy of the items table.
+
+--------------------------------------------------------------------------------
+2) MEAL / CONTEXT DETAILS SHARED IN THE PROMPT
+--------------------------------------------------------------------------------
+
+A) SYSTEM MESSAGE (Anthropic "system" or OpenAI system role)
+   = MASTER_SYSTEM_PROMPT (masterPrompt.js: Kerry identity, voice rules,
+      macros, Henry EER, meal photo protocol, V3 carousel rules, hard stops)
+   + buildBrainInjection(...) from composer.js:
+        • "=== RUNTIME HARD STOPS & CORRECTIONS ===" from knowledge_entries
+          (type 'never' and 'correction')
+        • "=== KNOWLEDGE SNIPPETS (retrieved) ===" from pgvector
+          match_knowledge_chunks (default 6 chunks, full chunk content)
+
+B) USER MESSAGE — starts with v3CarouselUserPrompt() which includes:
+
+   (i) V3_CAROUSEL_TASK_SUFFIX — JSON schema + high-level carousel rules
+
+   (ii) "ATHLETE & CONTEXT:" + factsJson
+        JSON built in mealCarouselPost (analysisFacts), sample shape below.
+
+   (iii) "VERIFIED MEALS CANDIDATES ..." + verifiedSummary (see section 1A)
+
+   (iv) If AI gap-fill is needed (need > 0), appended blocks:
+        • "WHEN GENERATING NEW MEALS:" + bullet instructions (read context,
+          match V1/V2, preferences, dietary reqs, combine 3–6 catalog items,
+          image_prompt, foods with item_id, etc.)
+        • itemsCatalog (section 1B)
+        • "Generate exactly {need} meals as JSON..."
+
+   factsJson typically includes:
+     firstName, mission_id, slot_id, slot_label, slot_guidance, based_on,
+     meal_category, need_count,
+     athlete { first_name, age, sex, weight_kg, height_cm, goals,
+               biggest_challenges, meal_priority, weight_trend, eating_style,
+               dietary_requirements, medical_flags, cooking_skills },
+     preferences { liked_foods, fav_foods_raw, disliked_foods,
+                   disliked_foods_raw },
+     training { load_day, activity_type, days_low/med/high, session_length },
+     daily_eer { load_day, kcal_low/high, protein/carb/fat gram ranges },
+     target_band { kcal_low/high, kj_low/high, p/c/f _low/_high for THIS slot },
+     analysis_macros { from meal_analysis.macro_totals for based_on version },
+     dislikes, liked_foods (aliases),
+     current_meal_v1 { description (trimmed meal_text), image_url },
+     improved_meal_v2 { description, image_url }
+
+--------------------------------------------------------------------------------
+3) SAMPLE PROMPT (ILLUSTRATIVE VALUES — TRUNCATED WHERE NOTED)
+================================================================================
+
+---------- SYSTEM (first ~800 chars of MASTER_SYSTEM_PROMPT; full text in masterPrompt.js) ----------
+Identity and credentials
+You are Virtual Kez — the AI coaching voice of Kerry O'Bryan.
+[... ~9000 chars omitted: credentials, voice rules, macros, Henry EER, meal analysis protocol, V3 rules, hard stops ...]
+
+=== RUNTIME HARD STOPS & CORRECTIONS ===
+- [HARD STOP] (example) Never recommend raw egg whites for minors without context.
+- [CORRECTION] (example) if wrong: "skip breakfast" → use: "front-load protein at breakfast when training PM."
+
+=== KNOWLEDGE SNIPPETS (retrieved) ===
+[1] (score 0.412)
+Queensland heat — add 300–500 ml fluid per hour of outdoor field session...
+[... up to 6 chunks, each can be very long in production ...]
+
+---------- SYSTEM SUFFIX (when json: true) ----------
+Reply with VALID JSON only. No markdown, no preamble, no code fences.
+
+---------- USER ----------
+Current task: V3_MEAL_CAROUSEL_JSON
+Output VALID JSON ONLY — no markdown. Schema:
+{"meals":[{"title":"string","description":"string","blueprintNote":"string","image_prompt":"string","source":"database"|"kez_generated","unverified_foods":["string"],"foods":[{"food_name":"string","weight_grams":number,"energy_kj":number,"protein_g":number,"carb_g":number,"fat_g":number}],"totals":{"energy_kj":number,"protein_g":number,"carb_g":number,"fat_g":number}}]}
+Rules: same meal category as requested; respect dislikes; prefer verified DB meals when listed in CONTEXT; for kez_generated tag unverified items in unverified_foods and mention [UNVERIFIED — needs Kerry review] inside blueprintNote.
+
+ATHLETE & CONTEXT:
+{
+  "firstName": "Alex",
+  "mission_id": "mission_breakfast",
+  "slot_id": "slot_1",
+  "slot_label": "Breakfast",
+  "slot_guidance": "Breakfast: emphasise protein vs daily target...",
+  "based_on": "v2",
+  "meal_category": "Breakfast",
+  "need_count": 1,
+  "athlete": {
+    "first_name": "Alex",
+    "age": 16,
+    "sex": "Male",
+    "weight_kg": 72.5,
+    "height_cm": 178,
+    "goals": ["Gain lean mass", "Improve game-day fueling"],
+    "biggest_challenges": ["Skipping breakfast before school training"],
+    "meal_priority": "Breakfast",
+    "weight_trend": "Stable",
+    "eating_style": ["At home", "Grab-and-go weekdays"],
+    "dietary_requirements": [],
+    "medical_flags": [],
+    "cooking_skills": "Basic"
+  },
+  "preferences": {
+    "liked_foods": ["Eggs", "Oats", "Banana", "Greek yoghurt"],
+    "fav_foods_raw": "Toast with avo, smoothies",
+    "disliked_foods": ["mushroom", "olives"],
+    "disliked_foods_raw": "Hates mushrooms and olives"
+  },
+  "training": {
+    "load_day": "Moderate",
+    "activity_type": ["Field", "Gym"],
+    "days_low": 2,
+    "days_med": 3,
+    "days_high": 2,
+    "session_length": "60–90 min"
+  },
+  "daily_eer": {
+    "load_day": "Moderate",
+    "kcal_low": 2800,
+    "kcal_high": 3200,
+    "protein_g_low": 115,
+    "protein_g_high": 160,
+    "carb_g_low": 360,
+    "carb_g_high": 430,
+    "fat_g_low": 95,
+    "fat_g_high": 115
+  },
+  "target_band": {
+    "kcal_low": 616,
+    "kcal_high": 704,
+    "kj_low": 2580,
+    "kj_high": 2950,
+    "p_low": 25,
+    "p_high": 35,
+    "c_low": 79,
+    "c_high": 95,
+    "f_low": 21,
+    "f_high": 25
+  },
+  "analysis_macros": {
+    "protein_g": 12,
+    "carb_g": 55,
+    "fat_g": 18,
+    "kcal": 420
+  },
+  "dislikes": ["mushroom", "olives"],
+  "liked_foods": ["Eggs", "Oats", "Banana", "Greek yoghurt"],
+  "current_meal_v1": {
+    "description": "Two pieces white toast with jam and a coffee, rushed before the bus.",
+    "image_url": "https://example.com/storage/v1/meal_v1.jpg"
+  },
+  "improved_meal_v2": {
+    "description": "Toast plus a banana and a glass of milk; still light on protein.",
+    "image_url": "https://example.com/storage/v1/meal_v2.jpg"
+  }
+}
+
+VERIFIED MEALS CANDIDATES (prefer these when you can — use exact totals if you choose one):
+- Protein oats cup: P 28g C 62g F 14g 2450kJ
+- Smashed avo + eggs plate: P 22g C 48g F 26g 2680kJ
+
+WHEN GENERATING NEW MEALS:
+- READ THE CONTEXT FIRST. Before picking ingredients, study FACTS.athlete ...
+- MATCH WHAT THEY EAT. If FACTS.current_meal_v1.description ...
+- HONOUR PREFERENCES. ...
+- RESPECT DIETARY REQUIREMENTS. ...
+- Compose each meal by COMBINING 3–6 DIFFERENT food items from the ITEMS catalog below ...
+  • Pick items from complementary categories ...
+  • Specify a realistic weight in grams ...
+  • Hard rule: every food MUST come from the catalog. ...
+- For each generated meal:
+    title: ...
+    description: ...
+    blueprintNote: ...
+    image_prompt: ...
+    foods[]: each entry must include item_id ...
+    source: "kez_generated".
+
+FOOD CATEGORIES (id|name): 1|Breakfast, 2|Lunch, 3|Snacks, ...
+FOOD SUB-CATEGORIES (id|title): 10|Cereal, 11|Dairy, ...
+
+ITEMS (3 sample rows of many; columns: id|title|category|P|C|F|kJ|serving):
+101|Rolled oats quick cook|Grains & Cereals|12.5|68|8|1320|40g
+204|Whole eggs large|Protein|12.6|1.1|10|600|100g
+330|Banana fresh|Fruit|1.3|23|0.3|360|120g
+[... hundreds more lines in production ...]
+
+Generate exactly 1 meals as JSON. Every meal must combine multiple catalog items.
+
+================================================================================
+END OF SAMPLE
+================================================================================
+
+NOTE ON TOKEN SIZE
+------------------
+The Anthropic error "208955 tokens > 200000" usually means the SYSTEM side
+(MASTER_SYSTEM_PROMPT + very large knowledge chunk hits) plus the USER side
+(items catalog + FACTS) exceeded the model limit. Mitigations (if not already
+in your branch): cap knowledge chunk length/total, shrink the items catalog
+(slot filter, fewer columns), or route this endpoint to OpenAI long-context.

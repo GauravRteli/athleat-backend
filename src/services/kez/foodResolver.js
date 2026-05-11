@@ -1,5 +1,6 @@
 const { query } = require("../../config/postgres");
 const { callLlmText, extractJsonObject } = require("./llm");
+const { shapeItem } = require("../foodsService");
 
 function tokenize(s) {
   return String(s || "")
@@ -9,41 +10,45 @@ function tokenize(s) {
     .filter((w) => w.length > 2);
 }
 
+// Canonical foods now live in `public.items` (legacy ~800-row Library table).
+// `foodsService.shapeItem` normalises each row to the per-serve macro shape
+// (`food_name`, `weight_g`, `energy_kj`, `protein_g`, `carb_g`, `fat_g`, ...).
 async function searchFoodCandidates(label, limit = 12) {
   const tokens = tokenize(label);
   const uniq = [...new Set(tokens)].slice(0, 4);
+
   if (uniq.length === 0) {
     const { rows } = await query(
-      `SELECT id, food_name, serving_label, weight_g, energy_kj, energy_kcal, protein_g, carb_g, fat_g, category
-       FROM public.foods
-       WHERE is_active = true
+      `SELECT * FROM public.items
+       WHERE COALESCE(is_locked, false) = false
+       ORDER BY created_at DESC NULLS LAST
        LIMIT $1`,
       [limit],
     );
-    return rows || [];
+    return (rows || []).map(shapeItem);
   }
 
-  const orParts = uniq.map((_, i) => `food_name ILIKE $${i + 2}`);
+  const orParts = uniq.map((_, i) => `title ILIKE $${i + 2}`);
   const orSql = orParts.join(" OR ");
   const params = [limit, ...uniq.map((t) => `%${t}%`)];
   const { rows } = await query(
-    `SELECT id, food_name, serving_label, weight_g, energy_kj, energy_kcal, protein_g, carb_g, fat_g, category
-     FROM public.foods
-     WHERE is_active = true AND (${orSql})
+    `SELECT * FROM public.items
+     WHERE COALESCE(is_locked, false) = false AND (${orSql})
      LIMIT $1`,
     params,
   );
-  const list = rows || [];
+  const list = (rows || []).map(shapeItem);
   if (list.length >= 3) return list;
 
+  // Fallback: try a single-token ILIKE if multi-token search came up empty.
   const { rows: rows2 } = await query(
-    `SELECT id, food_name, serving_label, weight_g, energy_kj, energy_kcal, protein_g, carb_g, fat_g, category
-     FROM public.foods
-     WHERE is_active = true AND food_name ILIKE $2
+    `SELECT * FROM public.items
+     WHERE COALESCE(is_locked, false) = false AND title ILIKE $2
      LIMIT $1`,
     [limit, `%${uniq[0]}%`],
   );
-  return ((rows2 && rows2.length ? rows2 : list) || []).slice(0, limit);
+  const fallback = (rows2 || []).map(shapeItem);
+  return (fallback.length ? fallback : list).slice(0, limit);
 }
 
 async function resolveLabelToFood(label, gramsEstimate, confidence, llmPick = true) {

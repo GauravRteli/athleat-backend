@@ -4,8 +4,9 @@ const MEDICAL_HINT =
   /\b(diagnos|diabetes|celiac|coeliac|eating disorder|anorex|bulim|IBS|crohn|colitis|coaching you for your condition|your deficiency)\b/i;
 const BESPOKE_PLAN =
   /\b(full (week |)meal plan|personalised meal plan|write me a (7|seven)[ -]day|macros? for every meal)\b/i;
-const CARB_COVERAGE = /\b(carb|carbohydrate|fuel|energy|glycogen)\b/i;
+const CARB_COVERAGE = /\b(carb|carbohydrate|fuel|energy|glycogen|training load|load)\b/i;
 const PROTEIN_COVERAGE = /\b(protein|recovery|muscle|repair)\b/i;
+const SLOT_ALIGNMENT = /\b(breakfast|lunch|dinner|training|game day|pre[- ]?match|post[- ]?match|kick[- ]?off)\b/i;
 const MICRONUTRIENT_COVERAGE =
   /\b(micronutrient|iron|vitamin|calcium|magnesium|zinc|folate|potassium|colour|vegetable|veggie|fruit|greens?)\b/i;
 const POSITIVE_ENDING =
@@ -18,7 +19,7 @@ function wordCount(text) {
     .filter(Boolean).length;
 }
 
-function validateMealFeedback(text, { firstName, mealAnalysis = false } = {}) {
+function validateMealFeedback(text, { firstName, mealAnalysis = false, slotLabel = null } = {}) {
   const issues = [];
   if (!text || !String(text).trim()) {
     issues.push("empty");
@@ -49,6 +50,17 @@ function validateMealFeedback(text, { firstName, mealAnalysis = false } = {}) {
 
     const tail = t.split(/\s+/).slice(-32).join(" ");
     if (!POSITIVE_ENDING.test(tail)) issues.push("missing_positive_ending");
+
+    // Soft slot alignment — the analysis should at least mention the slot it
+    // is about ("breakfast", "training", "game day", etc). Treated as a
+    // non-blocking issue by the caller (one retry, then accept).
+    if (!SLOT_ALIGNMENT.test(t)) issues.push("missing_slot_alignment");
+    else if (slotLabel) {
+      const s = String(slotLabel).toLowerCase().trim();
+      if (s && !new RegExp(`\\b${s.replace(/[^a-z0-9 ]+/g, "")}\\b`, "i").test(t)) {
+        // Optional finer-grained warn — keep the issue list informative without blocking.
+      }
+    }
   }
 
   return { ok: issues.length === 0, issues };

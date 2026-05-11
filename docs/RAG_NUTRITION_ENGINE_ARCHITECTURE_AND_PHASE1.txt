@@ -1,0 +1,86 @@
+================================================================================
+ATHLEAAT — RAG NUTRITION ENGINE (SHORT)
+Retrieval first, then AI meal composition. Architecture + Phase 1 at a glance.
+================================================================================
+Audience: everyone. Doc only — no code changes.
+Last updated: 2026-05-11
+
+--------------------------------------------------------------------------------
+1) THE PROBLEM (PLAIN ENGLISH)
+--------------------------------------------------------------------------------
+Today the AI often gets a huge list of foods in one message and must (a) find
+what fits the athlete and (b) compose realistic meals — both in one go.
+
+That is like giving a chef every ingredient in the warehouse on one page. The
+page has a hard size limit (AI "token" limit). Too big → errors, or the list
+gets trimmed and great options disappear. Wrong approach: "bigger prompt."
+
+--------------------------------------------------------------------------------
+2) TODAY IN THIS REPO (ONE LINE EACH)
+--------------------------------------------------------------------------------
+• Foods live in PostgreSQL `public.items`.
+• V3 carousel gap-fill builds a large text catalog via `buildItemsCatalog()` in
+  `kezController.js` and sends it + athlete FACTS + system prompt in one LLM
+  call (`callLlmText`).
+• Verified carousel cards come from DB scoring first — different path.
+
+--------------------------------------------------------------------------------
+3) THE FIX (ONE SENTENCE)
+--------------------------------------------------------------------------------
+Retrieve a SMALL set of relevant foods first (SQL filters and/or vector
+search), then call the AI ONLY with that short list to compose meals.
+
+That pattern is RAG: Retrieval-Augmented Generation.
+
+Important: splitting into TWO LLM calls but BOTH still reading the full catalog
+does NOT fix size. Job 1 must leave the LLM: use DB + vectors to pick top-K.
+
+--------------------------------------------------------------------------------
+4) PHASE 1 — WHAT TO BUILD (ORDER)
+--------------------------------------------------------------------------------
+(1) Per-food metadata — e.g. diet_type, meal_types, cuisine, tags, digestion
+    (structured JSON from a cheap model or rules). Store e.g. `food_ai_metadata`
+    with `food_id` → `public.items.id`.
+
+(2) One "semantic text" per food — name + tags smashed into a paragraph for
+    embedding only (users never need to read it).
+
+(3) Embeddings — e.g. OpenAI `text-embedding-3-small` (server-side API only).
+
+(4) Store vectors — PostgreSQL + pgvector, or Supabase Postgres + pgvector.
+
+(5) At meal time — build query text from athlete + slot + goals; embed it;
+    nearest-neighbour search + SQL filters (diet, dislikes); top 20–60 rows.
+
+(6) Meal LLM — same rules as today ("only catalog foods") but catalog = those
+    K rows only. Validate JSON / item_ids as you do now.
+
+--------------------------------------------------------------------------------
+5) WHY THIS FIXES PROMPT-SIZE ERRORS
+--------------------------------------------------------------------------------
+Huge prompts fail because system + FACTS + ITEMS catalog exceeds the model
+window. The catalog is the fattest piece. RAG replaces ~1000 lines with ~20–60
+relevant lines → headroom back. Also cap large "brain" / knowledge injections
+if they blow the system side (see `v3_carousel_prompt_sample.txt`).
+
+--------------------------------------------------------------------------------
+6) STACK (RESOURCES)
+--------------------------------------------------------------------------------
+• DB: PostgreSQL (already).
+• Vectors: pgvector (self-hosted Postgres) OR Supabase with pgvector.
+• Embeddings: OpenAI Embeddings API (or another provider — keep model name
+  versioned in DB; never mix different embedding models in one index).
+• Metadata labelling: small JSON-focused model (batch / on item save).
+• Meal reasoning: your existing strong model; prompt stays small.
+
+--------------------------------------------------------------------------------
+7) GLOSSARY
+--------------------------------------------------------------------------------
+Token — billing / context unit; long prompts = many tokens.
+Embedding — vector of numbers = "meaning" of a text for similarity search.
+RAG — retrieve context first, then generate; retrieval > giant prompts.
+Hallucination — plausible food name not in your DB; smaller candidate set helps.
+
+================================================================================
+END
+================================================================================

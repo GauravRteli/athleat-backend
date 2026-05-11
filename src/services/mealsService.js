@@ -170,7 +170,14 @@ async function getMealById(id, client = null) {
   return shapeMeal(mealRes.rows[0], foods, categories, subCategories, tags);
 }
 
-async function listMeals({ category, categoryId, subCategoryId, search, limit = 200 } = {}) {
+async function listMeals({
+  category,
+  categoryId,
+  subCategoryId,
+  search,
+  itemIds,
+  limit = 200,
+} = {}) {
   const conditions = [];
   const params = [];
   if (search) {
@@ -204,6 +211,22 @@ async function listMeals({ category, categoryId, subCategoryId, search, limit = 
       `EXISTS (
          SELECT 1 FROM public.meal_sub_category msc
          WHERE msc.meal_id = m.id AND msc.sub_category_id = $${params.length}
+       )`,
+    );
+  }
+  // Filter by ingredient ids — AND semantics: the meal must include ALL of
+  // the requested items via the `item_meals` join table.
+  const cleanItemIds = cleanIds(itemIds);
+  if (cleanItemIds && cleanItemIds.length) {
+    params.push(cleanItemIds);
+    const countIdx = params.length;
+    conditions.push(
+      `m.id IN (
+         SELECT im.meal_id
+           FROM public.item_meals im
+          WHERE im.item_id = ANY($${countIdx}::bigint[])
+          GROUP BY im.meal_id
+         HAVING COUNT(DISTINCT im.item_id) = ${cleanItemIds.length}
        )`,
     );
   }

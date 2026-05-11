@@ -10,10 +10,12 @@ const DEFAULT_CARB_GKG = {
   High: { low: 6.5, high: 7.0 },
 };
 
+// Prescreen rows come from `SELECT * FROM public.prescreen` (snake_case columns).
+// Older callers may pass a camelCase-shaped object — accept both.
 function classifyLoadFromPrescreen(prescreen) {
   if (!prescreen) return "Moderate";
-  const high = Number(prescreen.daysHigh) || 0;
-  const med = Number(prescreen.daysMed) || 0;
+  const high = Number(prescreen.days_high ?? prescreen.daysHigh) || 0;
+  const med = Number(prescreen.days_med ?? prescreen.daysMed) || 0;
   if (high >= 3) return "High";
   if (med >= 2) return "Moderate";
   return "Lower";
@@ -33,7 +35,7 @@ function ageFromDob(dob) {
 
 function computeDailyEER(prescreen, loadDay, eerConfig = {}) {
   const age = ageFromDob(prescreen?.dob);
-  const weight = parseFloat(prescreen?.weight);
+  const weight = parseFloat(prescreen?.weight_kg ?? prescreen?.weight);
   const sex = prescreen?.sex || "Male";
   if (!age || !weight) return null;
 

@@ -52,4 +52,28 @@ async function uploadFile(base64Data, options = {}) {
   };
 }
 
-module.exports = { uploadImage, uploadFile };
+// Upload by remote HTTPS URL — Cloudinary's SDK accepts a URL directly so we
+// can pipe AI-generated image URLs (e.g. OpenAI Images) straight into the
+// asset library without round-tripping bytes through Node.
+async function uploadRemoteUrl(remoteUrl, options = {}) {
+  if (!remoteUrl || !/^https?:\/\//i.test(remoteUrl)) {
+    throw new Error("uploadRemoteUrl requires an http(s) URL");
+  }
+  const folder = options.folder
+    ? `${FOLDER}/${options.folder}`
+    : FOLDER;
+
+  const result = await cloudinary.uploader.upload(remoteUrl, {
+    folder,
+    resource_type: "image",
+  });
+
+  return {
+    url: result.secure_url,
+    publicId: result.public_id,
+    width: result.width,
+    height: result.height,
+  };
+}
+
+module.exports = { uploadImage, uploadFile, uploadRemoteUrl };

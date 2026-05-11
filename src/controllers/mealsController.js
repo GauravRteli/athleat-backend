@@ -6,6 +6,17 @@ const {
   softDeleteMeal,
 } = require("../services/mealsService");
 
+// `item_ids` can come in as either a CSV string ("12,34") or repeated query
+// params ("?item_ids=12&item_ids=34"). Normalise both shapes here.
+function parseItemIdsParam(value) {
+  if (value == null || value === "") return undefined;
+  if (Array.isArray(value)) return value;
+  return String(value)
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
 async function getAll(req, res, next) {
   try {
     const data = await listMeals({
@@ -13,6 +24,7 @@ async function getAll(req, res, next) {
       categoryId: req.query.category_id || undefined,
       subCategoryId: req.query.sub_category_id || undefined,
       search: req.query.search || undefined,
+      itemIds: parseItemIdsParam(req.query.item_ids),
     });
     return res.status(200).json({ data });
   } catch (error) {
