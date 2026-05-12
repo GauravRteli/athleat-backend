@@ -13,6 +13,7 @@ const wrap = (fn) => async (req, res, next) => {
 module.exports = {
   // categories
   getCategories: wrap(() => svc.listCategories()),
+  getMealTimeCategories: wrap(() => svc.listMealTimeCategories()),
   postCategory: wrap((req) => svc.createCategory(req.body || {})),
   patchCategory: wrap((req) => svc.updateCategory(req.params.id, req.body || {})),
   deleteCategory: wrap(async (req) => {

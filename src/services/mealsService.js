@@ -2,8 +2,8 @@
 // mealsService — adapter onto the legacy bigserial `public.meals` table.
 //
 // Reads aggregate macros from `public.item_meals` and joins to `public.items`
-// for ingredient names. Categories / sub-categories / tags come from the
-// `meal_category`, `meal_sub_category`, `meal_tag` join tables.
+// for ingredient names. Meal-time categories / sub-categories / tags come from
+// `meal_category` → `public.categories`, `meal_sub_category`, `meal_tag`.
 //
 // Dashboard-only fields are mapped onto existing legacy columns:
 //   blueprint_note  → public.meals.note
@@ -97,12 +97,12 @@ function shapeMeal(row, foods = [], categories = [], subCategories = [], tags = 
     categories,
     sub_categories: subCategories,
     tags,
-    // Parent names (`meal_category` → `food_categories`).
+    // Meal-time labels (`meal_category` → `public.categories.title`, exposed as `name` for API compat).
     category:
       categories.length > 0
         ? categories.map((c) => c.name).filter(Boolean).join(" · ")
         : null,
-    // Sub names (`meal_sub_category` → `sub_categories`) for list cards / filters.
+    // Sub names (`meal_sub_category` → `sub_categories`) — optional secondary tags.
     sub_category:
       subCategories.length > 0
         ? subCategories.map((s) => s.title).filter(Boolean).join(" · ")
@@ -129,11 +129,11 @@ async function fetchMealFoods(mealId, client = null) {
 async function fetchMealCategories(mealId, client = null) {
   const exec = client ? client.query.bind(client) : query;
   const result = await exec(
-    `SELECT fc.id, fc.name
+    `SELECT c.id, c.title AS name
        FROM public.meal_category mc
-       JOIN public.food_categories fc ON fc.id = mc.category_id
+       JOIN public.categories c ON c.id = mc.category_id
       WHERE mc.meal_id = $1
-      ORDER BY fc.name`,
+      ORDER BY c.sort_order NULLS LAST, c.title`,
     [mealId],
   );
   return result.rows;
@@ -197,12 +197,12 @@ async function listMeals({
     conditions.push(
       `EXISTS (
          SELECT 1 FROM public.meal_category mc
-         JOIN public.food_categories fc ON fc.id = mc.category_id
-         WHERE mc.meal_id = m.id AND fc.name = $${params.length}
+         JOIN public.categories c ON c.id = mc.category_id
+         WHERE mc.meal_id = m.id AND LOWER(c.title) = LOWER($${params.length})
        )`,
     );
   }
-  // Filter by category id via the meal_category join table (UI dropdown).
+  // Filter by meal-time category id via `meal_category` (public.categories).
   if (categoryId) {
     params.push(Number(categoryId));
     conditions.push(
@@ -263,9 +263,9 @@ async function listMeals({
       [ids],
     ),
     query(
-      `SELECT mc.meal_id, fc.id, fc.name
+      `SELECT mc.meal_id, c.id, c.title AS name
          FROM public.meal_category mc
-         JOIN public.food_categories fc ON fc.id = mc.category_id
+         JOIN public.categories c ON c.id = mc.category_id
         WHERE mc.meal_id = ANY($1::bigint[])`,
       [ids],
     ),

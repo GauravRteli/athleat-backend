@@ -48,6 +48,20 @@ async function deleteCategory(id) {
   await query(`DELETE FROM public.food_categories WHERE id = $1`, [id]);
 }
 
+// ───────────────────────────── meal-time categories (`public.categories`) ─
+
+/** Meal timing slots (Breakfast, Lunch, …) — used by `meal_category.category_id`. */
+async function listMealTimeCategories() {
+  const r = await query(
+    `SELECT c.id, c.title, c.description, c.scheduled_time, c.sort_order, c.image,
+            c.created_at, c.updated_at,
+            (SELECT COUNT(*)::int FROM public.meal_category mc WHERE mc.category_id = c.id) AS meal_count
+       FROM public.categories c
+      ORDER BY c.sort_order ASC NULLS LAST, c.id ASC`,
+  );
+  return r.rows;
+}
+
 // ───────────────────────────── sub categories ─────────────────────────────
 
 async function listSubCategories({ categoryId } = {}) {
@@ -286,6 +300,7 @@ module.exports = {
   createCategory,
   updateCategory,
   deleteCategory,
+  listMealTimeCategories,
   listSubCategories,
   createSubCategory,
   updateSubCategory,

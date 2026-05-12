@@ -599,9 +599,9 @@ async function mealAnalysisPost(req, res) {
 }
 
 // Load verified meals from the legacy stack (`public.meals` + `public.item_meals` +
-// `public.items` + `public.meal_category` + `public.food_categories`).
+// `public.items` + `public.meal_category` + `public.categories`).
 //
-// `categoryExact` matches by `food_categories.name` exactly (case-insensitive).
+// `categoryExact` matches by `public.categories.title` exactly (case-insensitive).
 // When supplied, only meals tagged with at least one of those categories are
 // returned. Falls back to all meals if `categoryExact` is null.
 async function loadLegacyMealsWithFoods(categoryExact) {
@@ -613,8 +613,8 @@ async function loadLegacyMealsWithFoods(categoryExact) {
     categoryFilter = `
       AND EXISTS (
         SELECT 1 FROM public.meal_category mc
-        JOIN public.food_categories fc ON fc.id = mc.category_id
-        WHERE mc.meal_id = m.id AND LOWER(fc.name) = LOWER($${params.length})
+        JOIN public.categories c ON c.id = mc.category_id
+        WHERE mc.meal_id = m.id AND LOWER(c.title) = LOWER($${params.length})
       )`;
   }
 
@@ -643,9 +643,9 @@ async function loadLegacyMealsWithFoods(categoryExact) {
       [ids],
     ),
     query(
-      `SELECT mc.meal_id, fc.id AS category_id, fc.name AS category_name
+      `SELECT mc.meal_id, c.id AS category_id, c.title AS category_name
          FROM public.meal_category mc
-         JOIN public.food_categories fc ON fc.id = mc.category_id
+         JOIN public.categories c ON c.id = mc.category_id
         WHERE mc.meal_id = ANY($1::bigint[])`,
       [ids],
     ),

@@ -4,6 +4,7 @@ const c = require("../controllers/libraryController");
 const router = express.Router();
 
 router.get("/categories", c.getCategories);
+router.get("/meal-time-categories", c.getMealTimeCategories);
 router.post("/categories", c.postCategory);
 router.patch("/categories/:id", c.patchCategory);
 router.delete("/categories/:id", c.deleteCategory);
