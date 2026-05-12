@@ -97,8 +97,16 @@ function shapeMeal(row, foods = [], categories = [], subCategories = [], tags = 
     categories,
     sub_categories: subCategories,
     tags,
-    category: categories[0]?.name || null,           // back-compat: surface first cat as `category`
-    sub_category: subCategories[0]?.title || null,
+    // Parent names (`meal_category` → `food_categories`).
+    category:
+      categories.length > 0
+        ? categories.map((c) => c.name).filter(Boolean).join(" · ")
+        : null,
+    // Sub names (`meal_sub_category` → `sub_categories`) for list cards / filters.
+    sub_category:
+      subCategories.length > 0
+        ? subCategories.map((s) => s.title).filter(Boolean).join(" · ")
+        : null,
     created_at: row.created_at,
     updated_at: row.updated_at,
     foods,
