@@ -14,9 +14,11 @@ const {
   assembleMealAnalysisSystemPrompt,
   mealAnalysisUserPrompt,
   buildBrainInjection,
-  v3CarouselUserPrompt,
 } = require("../services/kez/composer");
-const { MEAL_ANALYSIS_TASK_SUFFIX } = require("../services/kez/masterPrompt");
+const {
+  MEAL_ANALYSIS_TASK_SUFFIX,
+  MASTER_SYSTEM_PROMPT,
+} = require("../services/kez/masterPrompt");
 const { callLlmText, extractJsonObject } = require("../services/kez/llm");
 const {
   validateMealFeedback,
@@ -24,11 +26,15 @@ const {
   applyHardStopTemplates,
   stripHealthyUnhealthy,
 } = require("../services/kez/validators");
-const { scoreMealCandidate, mealExcludedByDislikes } = require("../services/kez/carouselScorer");
 const { formatCarouselMacros } = require("../services/kez/format");
 const { resolveMealImageUrlForVision } = require("../services/kez/missionImageUrl");
 const { uploadRemoteUrl } = require("../services/uploadService");
 const mealsService = require("../services/mealsService");
+const { embedQuery } = require("../services/rag/embeddings");
+const {
+  buildAthleteQueryText,
+  formatVectorLiteral,
+} = require("../services/mealEmbeddings");
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || "dall-e-3";
@@ -598,180 +604,6 @@ async function mealAnalysisPost(req, res) {
   }
 }
 
-// Load verified meals from the legacy stack (`public.meals` + `public.item_meals` +
-// `public.items` + `public.meal_category` + `public.categories`).
-//
-// `categoryExact` matches by `public.categories.title` exactly (case-insensitive).
-// When supplied, only meals tagged with at least one of those categories are
-// returned. Falls back to all meals if `categoryExact` is null.
-async function loadLegacyMealsWithFoods(categoryExact) {
-  const useCat = categoryExact ? categoryExact.trim() : null;
-  const params = [];
-  let categoryFilter = "";
-  if (useCat) {
-    params.push(useCat);
-    categoryFilter = `
-      AND EXISTS (
-        SELECT 1 FROM public.meal_category mc
-        JOIN public.categories c ON c.id = mc.category_id
-        WHERE mc.meal_id = m.id AND LOWER(c.title) = LOWER($${params.length})
-      )`;
-  }
-
-  const { rows } = await query(
-    `SELECT m.id, m.title, m.description, m.note, m.image, m.user_id
-       FROM public.meals m
-      WHERE TRUE
-      ${categoryFilter}
-      ORDER BY m.created_at DESC NULLS LAST, m.id DESC
-      LIMIT 60`,
-    params,
-  );
-  if (!rows.length) return [];
-
-  const ids = rows.map((r) => r.id);
-  const [foodsRes, catsRes] = await Promise.all([
-    query(
-      `SELECT im.meal_id, im.id, im.item_id,
-              im.item_qty, im.item_qty_unit,
-              im.energy, im.protein, im.carbs, im.fat,
-              i.title AS item_title
-         FROM public.item_meals im
-         LEFT JOIN public.items i ON i.id = im.item_id
-        WHERE im.meal_id = ANY($1::bigint[])
-        ORDER BY im.meal_id, im."order" NULLS LAST, im.id ASC`,
-      [ids],
-    ),
-    query(
-      `SELECT mc.meal_id, c.id AS category_id, c.title AS category_name
-         FROM public.meal_category mc
-         JOIN public.categories c ON c.id = mc.category_id
-        WHERE mc.meal_id = ANY($1::bigint[])`,
-      [ids],
-    ),
-  ]);
-
-  const foodsByMeal = new Map();
-  for (const r of foodsRes.rows) {
-    const arr = foodsByMeal.get(r.meal_id) || [];
-    const energyKj = (() => {
-      if (r.energy == null) return null;
-      const m = String(r.energy).match(/-?\d+(?:\.\d+)?/);
-      return m ? Number(m[0]) : null;
-    })();
-    arr.push({
-      item_id: r.item_id,
-      food_id: r.item_id,
-      food_name: r.item_title || `Item #${r.item_id}`,
-      weight_g: Number(r.item_qty) || null,
-      energy_kj: energyKj,
-      protein_g: Number(r.protein) || 0,
-      carb_g: Number(r.carbs) || 0,
-      fat_g: Number(r.fat) || 0,
-    });
-    foodsByMeal.set(r.meal_id, arr);
-  }
-
-  const catsByMeal = new Map();
-  for (const r of catsRes.rows) {
-    const arr = catsByMeal.get(r.meal_id) || [];
-    arr.push({ id: Number(r.category_id), name: r.category_name });
-    catsByMeal.set(r.meal_id, arr);
-  }
-
-  return rows.map((r) => {
-    const meal_foods = foodsByMeal.get(r.id) || [];
-    const totals = meal_foods.reduce(
-      (acc, f) => ({
-        energy_kj: acc.energy_kj + (Number(f.energy_kj) || 0),
-        protein_g: acc.protein_g + (Number(f.protein_g) || 0),
-        carb_g: acc.carb_g + (Number(f.carb_g) || 0),
-        fat_g: acc.fat_g + (Number(f.fat_g) || 0),
-      }),
-      { energy_kj: 0, protein_g: 0, carb_g: 0, fat_g: 0 },
-    );
-    const energy_kcal = totals.energy_kj ? totals.energy_kj / 4.184 : 0;
-    return {
-      id: r.id,
-      title: r.title,
-      description: r.description || "",
-      blueprint_note: r.note || "",
-      image_url: r.image || "",
-      categories: catsByMeal.get(r.id) || [],
-      meal_foods,
-      energy_kj: totals.energy_kj,
-      energy_kcal,
-      protein_g: totals.protein_g,
-      carb_g: totals.carb_g,
-      fat_g: totals.fat_g,
-    };
-  });
-}
-
-// Build a compact, LLM-friendly catalog of the legacy `public.items` rows so
-// the model can pick real ingredient names + ids when it generates gap-fill
-// meals. Each row: `id|title|cat|P|C|F|kJ|serving`. Keeps total length under
-// ~60 000 chars by capping rows and trimming low-priority items.
-async function buildItemsCatalog({ maxChars = 60_000, hardLimit = 1000 } = {}) {
-  const { rows: items } = await query(
-    `SELECT i.id, i.title, i.category,
-            i.protein, i.carbs, i.fat, i.energy,
-            i.serving_size, i.serving_size_unit
-       FROM public.items i
-      WHERE COALESCE(i.is_locked, false) = false
-      ORDER BY i.category NULLS LAST, i.title ASC
-      LIMIT $1`,
-    [hardLimit],
-  );
-
-  const lineFor = (it) => {
-    const energyKj = (() => {
-      if (it.energy == null) return "";
-      const m = String(it.energy).match(/-?\d+(?:\.\d+)?/);
-      return m ? Math.round(Number(m[0])) : "";
-    })();
-    const serving =
-      it.serving_size != null
-        ? `${it.serving_size}${it.serving_size_unit || "g"}`
-        : "";
-    return [
-      it.id,
-      String(it.title || "").replace(/\|/g, "/"),
-      String(it.category || "").replace(/\|/g, "/"),
-      Number(it.protein) || 0,
-      Number(it.carbs) || 0,
-      Number(it.fat) || 0,
-      energyKj,
-      serving,
-    ].join("|");
-  };
-
-  let lines = items.map(lineFor);
-  let body = lines.join("\n");
-  // If over budget, trim from the tail until we fit. Worst case we end up
-  // with the alphabetically-earliest 200-300 items, still plenty for the LLM
-  // to compose meals.
-  while (body.length > maxChars && lines.length > 200) {
-    lines = lines.slice(0, Math.floor(lines.length * 0.8));
-    body = lines.join("\n");
-  }
-
-  const { rows: cats } = await query(
-    `SELECT id, name FROM public.food_categories ORDER BY name ASC LIMIT 200`,
-  );
-  const { rows: subs } = await query(
-    `SELECT id, title FROM public.sub_categories ORDER BY title ASC LIMIT 200`,
-  );
-
-  return [
-    `FOOD CATEGORIES (id|name): ${cats.map((c) => `${c.id}|${c.name}`).join(", ")}`,
-    `FOOD SUB-CATEGORIES (id|title): ${subs.map((c) => `${c.id}|${c.title}`).join(", ")}`,
-    "",
-    `ITEMS (${lines.length} rows; columns: id|title|category|P|C|F|kJ|serving):`,
-    body,
-  ].join("\n");
-}
-
 // Convert a legacy meal row + foods into a V3 carousel card.
 function legacyMealToCarouselCard(meal) {
   const foods = (meal.meal_foods || []).map((f) => ({
@@ -815,127 +647,181 @@ function legacyMealToCarouselCard(meal) {
   };
 }
 
-// Look up a single row in `public.items` by primary key and shape it like
-// `foodsService.shapeItem` so downstream macro scaling has the per-serve fields
-// it expects (`weight_g`, `protein_g`, `carb_g`, `fat_g`, `energy_kj`).
-async function lookupItemById(itemId) {
-  const id = Number(itemId);
-  if (!Number.isInteger(id) || id <= 0) return null;
-  const { shapeItem } = require("../services/foodsService");
-  const { rows } = await query(
-    `SELECT * FROM public.items WHERE id = $1 LIMIT 1`,
-    [id],
-  );
-  return rows[0] ? shapeItem(rows[0]) : null;
-}
-
-// Take an LLM-generated card, resolve each ingredient against `public.items`,
-// recompute totals from the actual items macros (never trust the LLM's math).
+// =============================================================================
+// Vector-driven carousel retrieval helpers.
 //
-// The carousel prompt instructs the model to emit `item_id` for every food
-// (so the catalog row is unambiguous). When that's present we look the row up
-// by primary key. Only when `item_id` is missing do we fall back to fuzzy
-// name search via `resolveLabelToFood`.
-async function finalizeGeneratedCard(card) {
-  const cleanFoods = [];
-  const macroLines = [];
-  const unverifiedNames = new Set(card.unverified_foods || []);
+// `mealCarouselPost` no longer pulls ALL meals by category and scores them in
+// JS. Instead it embeds an athlete-context query and lets
+// `public.match_meals` do the work in Postgres (hard category + dislikes
+// filters, then HNSW ANN ordering). These two helpers handle:
+//
+//   loadLegacyMealsByIds   — batched hydrate of meals by id, preserving the
+//                            input order so match_meals' ranking survives.
+//   fetchFallbackMealIds   — degraded fallback when vector search yields zero
+//                            rows (no embeddings yet, OpenAI hiccup, or no
+//                            usable query context). Pulls the newest meals in
+//                            the slot category, respecting dislikes.
+// =============================================================================
 
-  for (const f of card.foods || []) {
-    const name = String(f.food_name || "").trim();
-    const grams = Number(f.weight_grams ?? f.weight_g) || 100;
-    // Prefer model-supplied `item_id` (carousel prompt asks for it explicitly).
-    let resolvedRow = null;
-    let resolvedId = null;
-    if (f.item_id || f.food_id || f.id) {
-      const byId = await lookupItemById(f.item_id || f.food_id || f.id);
-      if (byId) {
-        resolvedRow = byId;
-        resolvedId = byId.id;
-      }
-    }
-    if (!resolvedRow) {
-      if (!name) continue;
-      const resolved = await resolveLabelToFood(name, grams, 0.8, false);
-      if (resolved.food_row) {
-        resolvedRow = resolved.food_row;
-        resolvedId = resolved.food_id;
-      }
-    }
-    if (resolvedRow) {
-      const resolved = { food_row: resolvedRow, food_id: resolvedId };
-      // Per `foodsService.shapeItem`, `weight_g` is the per-serving reference.
-      macroLines.push(scaleFoodRow(resolved.food_row, grams));
-      cleanFoods.push({
-        item_id: resolved.food_id,
-        food_id: resolved.food_id,
-        food_name: resolved.food_row.food_name || name,
-        weight_grams: grams,
-        weight_g: grams,
-        // Display macros for this row scaled to the chosen grams.
-        protein_g: +(Number(resolved.food_row.protein_g || 0) * (grams / (Number(resolved.food_row.weight_g) || grams))).toFixed(1),
-        carb_g: +(Number(resolved.food_row.carb_g || 0) * (grams / (Number(resolved.food_row.weight_g) || grams))).toFixed(1),
-        fat_g: +(Number(resolved.food_row.fat_g || 0) * (grams / (Number(resolved.food_row.weight_g) || grams))).toFixed(1),
-        energy_kj: +(Number(resolved.food_row.energy_kj || 0) * (grams / (Number(resolved.food_row.weight_g) || grams))).toFixed(0),
-      });
-    } else {
-      // No DB match — keep the LLM's numbers but mark unverified.
-      // Skip blank rows so we don't pollute the card with empty ingredients.
-      if (!name) continue;
-      unverifiedNames.add(name);
-      cleanFoods.push({
-        item_id: null,
-        food_id: null,
-        food_name: name,
-        weight_grams: grams,
-        weight_g: grams,
-        protein_g: Number(f.protein_g) || 0,
-        carb_g: Number(f.carb_g) || 0,
-        fat_g: Number(f.fat_g) || 0,
-        energy_kj: Number(f.energy_kj) || 0,
-      });
-      macroLines.push({
-        protein_g: Number(f.protein_g) || 0,
-        carb_g: Number(f.carb_g) || 0,
-        fat_g: Number(f.fat_g) || 0,
-        energy_kj: Number(f.energy_kj) || 0,
-        energy_kcal: 0,
-      });
-    }
+async function loadLegacyMealsByIds(orderedIds) {
+  if (!Array.isArray(orderedIds) || !orderedIds.length) return [];
+  const ids = orderedIds.map((v) => Number(v)).filter((n) => Number.isFinite(n));
+  if (!ids.length) return [];
+
+  const [mealRes, foodsRes, catsRes] = await Promise.all([
+    query(
+      `SELECT id, title, description, note, image, user_id
+         FROM public.meals
+        WHERE id = ANY($1::bigint[])`,
+      [ids],
+    ),
+    query(
+      `SELECT im.meal_id, im.id, im.item_id,
+              im.item_qty, im.item_qty_unit,
+              im.energy, im.protein, im.carbs, im.fat,
+              i.title AS item_title
+         FROM public.item_meals im
+         LEFT JOIN public.items i ON i.id = im.item_id
+        WHERE im.meal_id = ANY($1::bigint[])
+        ORDER BY im.meal_id, im."order" NULLS LAST, im.id ASC`,
+      [ids],
+    ),
+    query(
+      `SELECT mc.meal_id, c.id AS category_id, c.title AS category_name
+         FROM public.meal_category mc
+         JOIN public.categories c ON c.id = mc.category_id
+        WHERE mc.meal_id = ANY($1::bigint[])`,
+      [ids],
+    ),
+  ]);
+
+  // IMPORTANT: `public.meals.id` is a Postgres `bigint`, which `node-postgres`
+  // returns as a STRING. The carousel ranking from `match_meals` arrives as
+  // JS numbers, and we Number()-coerce input ids at the top of this helper.
+  // If we keyed the Maps by `r.id` directly we'd be mixing string and number
+  // keys → `Map.get` is strict-equality → every lookup would miss and
+  // hydrated would silently come back empty. Normalize every key to Number.
+  const foodsByMeal = new Map();
+  for (const r of foodsRes.rows) {
+    const mealKey = Number(r.meal_id);
+    const arr = foodsByMeal.get(mealKey) || [];
+    const energyKj = (() => {
+      if (r.energy == null) return null;
+      const m = String(r.energy).match(/-?\d+(?:\.\d+)?/);
+      return m ? Number(m[0]) : null;
+    })();
+    arr.push({
+      item_id: r.item_id,
+      food_id: r.item_id,
+      food_name: r.item_title || `Item #${r.item_id}`,
+      weight_g: Number(r.item_qty) || null,
+      energy_kj: energyKj,
+      protein_g: Number(r.protein) || 0,
+      carb_g: Number(r.carbs) || 0,
+      fat_g: Number(r.fat) || 0,
+    });
+    foodsByMeal.set(mealKey, arr);
   }
 
-  const totals = finalizeTotals(sumMacros(macroLines));
-  const final = {
-    title: card.title || "Kez suggestion",
-    description: card.description || "",
-    blueprintNote: card.blueprintNote || "",
-    image_url: "",
-    image_prompt: card.image_prompt || "",
-    source: card.source || "kez_generated",
-    unverified_foods: [...unverifiedNames],
-    foods: cleanFoods,
-    totals: {
+  const catsByMeal = new Map();
+  for (const r of catsRes.rows) {
+    const mealKey = Number(r.meal_id);
+    const arr = catsByMeal.get(mealKey) || [];
+    arr.push({ id: Number(r.category_id), name: r.category_name });
+    catsByMeal.set(mealKey, arr);
+  }
+
+  const byId = new Map();
+  for (const r of mealRes.rows) {
+    const mealKey = Number(r.id);
+    const meal_foods = foodsByMeal.get(mealKey) || [];
+    const totals = meal_foods.reduce(
+      (acc, f) => ({
+        energy_kj: acc.energy_kj + (Number(f.energy_kj) || 0),
+        protein_g: acc.protein_g + (Number(f.protein_g) || 0),
+        carb_g: acc.carb_g + (Number(f.carb_g) || 0),
+        fat_g: acc.fat_g + (Number(f.fat_g) || 0),
+      }),
+      { energy_kj: 0, protein_g: 0, carb_g: 0, fat_g: 0 },
+    );
+    const energy_kcal = totals.energy_kj ? totals.energy_kj / 4.184 : 0;
+    byId.set(mealKey, {
+      id: mealKey,
+      title: r.title,
+      description: r.description || "",
+      blueprint_note: r.note || "",
+      image_url: r.image || "",
+      categories: catsByMeal.get(mealKey) || [],
+      meal_foods,
       energy_kj: totals.energy_kj,
-      energy_kcal: totals.kcal,
+      energy_kcal,
       protein_g: totals.protein_g,
       carb_g: totals.carb_g,
       fat_g: totals.fat_g,
-    },
-  };
-  // Kez may forget to write an image prompt — synthesise a safe default so
-  // POST /save-suggestion always has something to send to OpenAI.
-  if (!final.image_prompt) {
-    final.image_prompt =
-      `Bright, appetising overhead photo of ${final.title}. ${final.description || ""}`.trim();
+    });
   }
-  final.formatted_macros = formatCarouselMacros({
-    p: final.totals.protein_g,
-    c: final.totals.carb_g,
-    f: final.totals.fat_g,
-    kcal: final.totals.energy_kcal,
-    kj: final.totals.energy_kj,
-  });
-  return final;
+
+  // Preserve the input ordering (match_meals' ANN ranking) — meals dropped
+  // by id-filter or hydration are silently skipped.
+  return ids.map((id) => byId.get(Number(id))).filter(Boolean);
+}
+
+async function fetchFallbackMealIds(category, dislikes, limit, excludeIds = []) {
+  const params = [];
+  const filters = [];
+
+  if (category) {
+    // Substring (not equality) so `slotCategory("Pre-Training") = "Training"`
+    // still pulls Pre-Training / Post-Training / Training - AM rows. Keeps
+    // parity with the same `LIKE` filter inside `public.match_meals`.
+    params.push(category);
+    filters.push(`EXISTS (
+      SELECT 1 FROM public.meal_category mc
+      JOIN public.categories c ON c.id = mc.category_id
+      WHERE mc.meal_id = m.id
+        AND LOWER(c.title) LIKE '%' || LOWER(TRIM($${params.length})) || '%'
+    )`);
+  }
+
+  if (Array.isArray(dislikes) && dislikes.length) {
+    const cleaned = dislikes.map((d) => String(d).toLowerCase().trim()).filter(Boolean);
+    if (cleaned.length) {
+      params.push(cleaned);
+      filters.push(`NOT EXISTS (
+        SELECT 1
+          FROM public.item_meals im
+          JOIN public.items i ON i.id = im.item_id
+         WHERE im.meal_id = m.id
+           AND EXISTS (
+             SELECT 1 FROM UNNEST($${params.length}::text[]) AS d
+              WHERE LOWER(i.title) LIKE '%' || d || '%'
+           )
+      )`);
+    }
+  }
+
+  // Past-V3 + in-session excludes — keeps fallback consistent with the
+  // vector path so the "Try different" rotation works even when ANN search
+  // is unavailable.
+  const cleanedExclude = Array.isArray(excludeIds)
+    ? excludeIds.map((v) => Number(v)).filter((n) => Number.isFinite(n) && n > 0)
+    : [];
+  if (cleanedExclude.length) {
+    params.push(cleanedExclude);
+    filters.push(`NOT (m.id = ANY ($${params.length}::bigint[]))`);
+  }
+
+  params.push(Math.max(1, Number(limit) || 10));
+  const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const { rows } = await query(
+    `SELECT m.id
+       FROM public.meals m
+       ${where}
+      ORDER BY m.created_at DESC NULLS LAST, m.id DESC
+      LIMIT $${params.length}`,
+    params,
+  );
+  return rows.map((r) => Number(r.id)).filter((n) => Number.isFinite(n));
 }
 
 async function mealCarouselPost(req, res) {
@@ -948,16 +834,24 @@ async function mealCarouselPost(req, res) {
       meal_analysis_id,
       slot_label,
       liked_foods: likedFoodsBody,
+      exclude_ids: excludeIdsBody,
     } = req.body || {};
     let target_count = Number(req.body?.target_count) || 3;
     const based_on = basedRaw === "v2" ? "v2" : "v1";
     const requestedLiked = Array.isArray(likedFoodsBody) ? likedFoodsBody : [];
+    // In-session exclude (frontend "Try different" button). Past-pick exclude
+    // is derived below from `meal_analysis` v3 history.
+    const clientExcludeIds = Array.isArray(excludeIdsBody)
+      ? excludeIdsBody.map((v) => Number(v)).filter((n) => Number.isFinite(n))
+      : [];
     const lbl = slot_label || slot_id;
 
     if (!student_id || !mission_id || !slot_id) {
       return res.status(400).json({ error: "student_id, mission_id, slot_id required" });
     }
 
+    // Pin the analysis row that drives the response. Either explicit
+    // (meal_analysis_id) or the latest v1/v2 for this slot.
     let analysis = null;
     if (meal_analysis_id) {
       const { rows } = await query(`SELECT * FROM public.meal_analysis WHERE id = $1`, [meal_analysis_id]);
@@ -974,13 +868,17 @@ async function mealCarouselPost(req, res) {
       analysis = rows?.[0] || null;
     }
 
-    // Fetch BOTH V1 and V2 analyses for this slot so the LLM can compare what
-    // the athlete currently eats (V1) with the version they tried in module
-    // (V2). The carousel rules say: "match meals by type and core
-    // ingredients — never replace a meal category" — so we want as much of
-    // the athlete's actual eating pattern in context as possible.
+    // Fetch BOTH V1 and V2 (eating pattern + module attempt) AND every V3
+    // pick the coach has previously sent for this slot. The V3 rows are
+    // used twice below:
+    //   • their `meal_text` becomes a soft "previously suggested" signal
+    //     in the embedded query, nudging ANN away from re-ranking the
+    //     same meals to the top;
+    //   • their `model_meta.meal_id` becomes a HARD exclude list passed
+    //     to `match_meals.exclude_meal_ids`, so an already-sent meal
+    //     never reappears in a future carousel for the same slot.
     const sideAnalysesPromise = query(
-      `SELECT version, meal_text, image_url, resolved_items, macro_totals
+      `SELECT version, meal_text, image_url, resolved_items, macro_totals, model_meta
          FROM public.meal_analysis
         WHERE student_id = $1 AND mission_id = $2 AND slot_id = $3
         ORDER BY created_at DESC`,
@@ -989,29 +887,18 @@ async function mealCarouselPost(req, res) {
 
     const [
       { rows: prescreenRows },
-      { rows: studentRows },
       { rows: eerRows },
       dbLikedFoods,
       { rows: sideAnalysisRows },
     ] = await Promise.all([
       query(`SELECT * FROM public.prescreen WHERE student_id = $1`, [student_id]),
-      query(`SELECT id, full_name, first_name FROM public.students WHERE id = $1`, [student_id]),
       query(`SELECT * FROM public.eer_config WHERE id = 1`),
       likedFoodsForStudent(student_id),
       sideAnalysesPromise,
     ]);
 
-    const prescreenRow = prescreenRows?.[0];
-    const studentRow = studentRows?.[0];
+    const prescreen = prescreenRows?.[0] || {};
     const eerRow = eerRows?.[0];
-    const prescreen = prescreenRow || {};
-
-    const firstName =
-      studentRow?.first_name ||
-      String(studentRow?.full_name || "Athlete")
-        .trim()
-        .split(/\s+/)[0] ||
-      "Athlete";
 
     // Merge client-supplied liked foods (free text) with the canonical list
     // resolved from `student_food_preferences` → `items.title`.
@@ -1039,226 +926,117 @@ async function mealCarouselPost(req, res) {
 
     const category = analysis?.category || slotCategory(lbl);
     const dislikes = dislikeList(prescreen);
-    const likedTokens = liked_foods.map((s) => String(s).toLowerCase());
 
-    const resolvedItems = analysis?.resolved_items || [];
-    const resolvedNameSet = new Set(
-      resolvedItems.map((r) => r.food_name || r.food_row?.food_name || r.label).filter(Boolean),
+    // ── 1) Build the athlete query text + embed it ─────────────────────────
+    // The query combines what the athlete eats now (V1), what they tried in
+    // module (V2), their preferences, dislikes, slot category, and the macro
+    // target band. `match_meals` then ranks meals by cosine similarity to
+    // this composite signal — far smarter than substring matching on
+    // ingredient names. Slot category is also passed as a hard SQL filter,
+    // so Breakfast carousel never returns dinner meals etc.
+    const v1Row = (sideAnalysisRows || []).find((r) => r.version === "v1");
+    const v2Row = (sideAnalysisRows || []).find((r) => r.version === "v2");
+    const v3Rows = (sideAnalysisRows || []).filter((r) => r.version === "v3");
+
+    // Build the past-V3 exclude set:
+    //   1. canonical meal_id stored in model_meta (set by mealAnalysisV3Post);
+    //   2. plus whatever the client sent for in-session rotation.
+    const v3PastMealIds = v3Rows
+      .map((r) => Number(r?.model_meta?.meal_id))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    const excludeMealIds = Array.from(
+      new Set([...v3PastMealIds, ...clientExcludeIds]),
     );
-    const macroTotals = analysis?.macro_totals || {};
 
-    // 1) Pull DB candidates from the legacy meals stack, scoped by slot category.
-    let allMeals = await loadLegacyMealsWithFoods(category || null);
-    if (!allMeals.length && category) {
-      allMeals = await loadLegacyMealsWithFoods(null);
-    }
+    const queryText = buildAthleteQueryText({
+      slotCategory: category,
+      slotLabel: lbl !== category ? lbl : null,
+      v1MealText: v1Row?.meal_text || null,
+      v2MealText: v2Row?.meal_text || null,
+      v3MealTexts: v3Rows.map((r) => r.meal_text).filter(Boolean),
+      likedFoods: liked_foods,
+      dislikedFoods: dislikes,
+      targetBand,
+    });
 
-    const candidates = allMeals.filter(
-      (m) => !mealExcludedByDislikes(m.meal_foods || [], dislikes),
-    );
-
-    const scored = candidates
-      .map((m) => ({
-        meal: m,
-        score: scoreMealCandidate(m, {
-          resolvedNameSet,
-          macroTotals,
-          targetBand,
-          likedTokens,
-        }),
-      }))
-      .sort((a, b) => b.score - a.score);
-
-    // Keep at most `target_count - 1` DB suggestions so there's room for at
-    // least one Kez-generated card (Kerry's spec: 3–4 DB + 1–2 generated).
-    const dbCap = Math.max(0, Math.min(target_count, target_count - 1, scored.length));
-    const verifiedCards = scored.slice(0, dbCap).map((s) => legacyMealToCarouselCard(s.meal));
-
-    let suggestions = [...verifiedCards];
-    const need = Math.max(0, target_count - suggestions.length);
-
-    const verifiedSummary = verifiedCards
-      .map(
-        (c) =>
-          `- ${c.title}: P ${Math.round(c.totals.protein_g)}g C ${Math.round(c.totals.carb_g)}g F ${Math.round(c.totals.fat_g)}g ${Math.round(c.totals.energy_kj)}kJ`,
-      )
-      .join("\n");
-
-    // 2) Build the compact items catalog the LLM picks ingredients from.
-    let itemsCatalog = "";
-    if (need > 0) {
+    // ── 2) Vector search via match_meals RPC ───────────────────────────────
+    // Hard category + dislike filters happen in SQL, ANN ordering happens
+    // against the HNSW index. We over-fetch a fat pool (>= 25, scaling with
+    // target_count) so step 4 has room to pick a fresh-looking mix on
+    // every call instead of the deterministic top-N.
+    let matchedRows = [];
+    if (queryText) {
       try {
-        itemsCatalog = await buildItemsCatalog();
-      } catch (e) {
-        console.error("buildItemsCatalog", e);
-      }
-    }
-
-    if (need > 0) {
-      const brain = await buildBrainInjection(`V3 carousel ${mission_id} ${slot_id} ${firstName}`);
-      const systemPrompt = assembleMealAnalysisSystemPrompt(brain);
-
-      // Collapse V1 / V2 history into compact strings so the LLM sees what
-      // the athlete actually eats for this slot.
-      const v1Row = (sideAnalysisRows || []).find((r) => r.version === "v1");
-      const v2Row = (sideAnalysisRows || []).find((r) => r.version === "v2");
-      const summariseMealText = (row) => {
-        if (!row?.meal_text) return null;
-        return String(row.meal_text).trim().slice(0, 600);
-      };
-
-      // Daily energy targets, rendered as human-readable ranges Kez can echo
-      // in `blueprintNote` if useful (always in kcal — keeps tokens cheap).
-      const dailyEerSummary = daily
-        ? {
-            load_day: daily.loadDay,
-            kcal_low: daily.eerLow,
-            kcal_high: daily.eerHigh,
-            protein_g_low: daily.protein.low,
-            protein_g_high: daily.protein.high,
-            carb_g_low: daily.carb.low,
-            carb_g_high: daily.carb.high,
-            fat_g_low: daily.fat.low,
-            fat_g_high: daily.fat.high,
-          }
-        : null;
-
-      const analysisFacts = {
-        firstName,
-        mission_id,
-        slot_id,
-        slot_label: lbl,
-        slot_guidance: slotGuidance(category),
-        based_on,
-        meal_category: category,
-        need_count: need,
-        athlete: {
-          first_name: firstName,
-          age: ageFromDob(prescreen?.dob),
-          sex: prescreen?.sex || null,
-          weight_kg: prescreen?.weight_kg ?? prescreen?.weight ?? null,
-          height_cm: prescreen?.height_cm ?? null,
-          goals: Array.isArray(prescreen?.goals) ? prescreen.goals : [],
-          biggest_challenges: Array.isArray(prescreen?.biggest_challenges)
-            ? prescreen.biggest_challenges
-            : [],
-          meal_priority: prescreen?.meal_priority || null,
-          weight_trend: prescreen?.weight_trend || null,
-          eating_style: Array.isArray(prescreen?.eating_style)
-            ? prescreen.eating_style
-            : [],
-          dietary_requirements: Array.isArray(prescreen?.dietary_reqs)
-            ? prescreen.dietary_reqs
-            : [],
-          medical_flags: Array.isArray(prescreen?.medical) ? prescreen.medical : [],
-          cooking_skills: prescreen?.cooking_skills || null,
-        },
-        preferences: {
-          liked_foods,
-          fav_foods_raw: prescreen?.fav_foods || null,
-          disliked_foods: dislikes,
-          disliked_foods_raw: prescreen?.dislike_foods || null,
-        },
-        training: {
-          load_day: loadDay,
-          activity_type: Array.isArray(prescreen?.activity_type)
-            ? prescreen.activity_type
-            : [],
-          days_low: Number(prescreen?.days_low) || 0,
-          days_med: Number(prescreen?.days_med) || 0,
-          days_high: Number(prescreen?.days_high) || 0,
-          session_length: prescreen?.session_length || null,
-        },
-        daily_eer: dailyEerSummary,
-        target_band: targetBand,
-        analysis_macros: macroTotals,
-        // Backwards-compat aliases so older prompt segments / validators
-        // that still read top-level `dislikes` / `liked_foods` keep working.
-        dislikes,
-        liked_foods,
-        current_meal_v1: summariseMealText(v1Row)
-          ? { description: summariseMealText(v1Row), image_url: v1Row.image_url || null }
-          : null,
-        improved_meal_v2: summariseMealText(v2Row)
-          ? { description: summariseMealText(v2Row), image_url: v2Row.image_url || null }
-          : null,
-      };
-      const factsJson = JSON.stringify(analysisFacts, null, 2);
-      const userPrompt = [
-        v3CarouselUserPrompt({
-          firstName,
-          factsJson,
-          verifiedMealsSummary: verifiedSummary || "(no close verified matches in database)",
-        }),
-        "",
-        "WHEN GENERATING NEW MEALS:",
-        "- READ THE CONTEXT FIRST. Before picking ingredients, study FACTS.athlete (age, sex, weight, height, goals, dietary_requirements, medical_flags), FACTS.training (load_day, activity_type, session_length), FACTS.daily_eer, and FACTS.target_band. The plate must serve THIS athlete on THIS training day.",
-        "- MATCH WHAT THEY EAT. If FACTS.current_meal_v1.description or FACTS.improved_meal_v2.description is present, keep the same meal type and core ingredients — make a smarter version of it, never a totally different cuisine. The athlete should look at V3 and think 'I could do that.'",
-        "- HONOUR PREFERENCES. FACTS.preferences.liked_foods is a weighted preference — prioritise these items when macros allow. FACTS.preferences.disliked_foods AND FACTS.dislikes are a HARD exclusion — never include any of those words, ingredients, or close synonyms.",
-        "- RESPECT DIETARY REQUIREMENTS. If FACTS.athlete.dietary_requirements lists 'Vegetarian' / 'Vegan' / 'Halal' / 'Gluten-free' / etc., obey it strictly. Same for any allergen-style entry in FACTS.athlete.medical_flags.",
-        "- Compose each meal by COMBINING 3–6 DIFFERENT food items from the ITEMS catalog below (by their numeric id and exact title).",
-        "  • Pick items from complementary categories — e.g. a protein item + a carb base + 1–2 vegetables/fruit + a fat source — so the plate looks like a real meal, not a single ingredient.",
-        "  • Specify a realistic weight in grams for each item so the totals land inside FACTS.target_band (P, C, F, kcal).",
-        "  • Hard rule: every food MUST come from the catalog. If a needed ingredient is missing, pick the closest available item instead of inventing one. Never invent foods outside the catalog.",
-        "- For each generated meal:",
-        "    title: a short coach-style name like \"Beef burrito bowl\" or \"Tropical oats\".",
-        "    description: one sentence on what the meal is.",
-        "    blueprintNote: one short line for Kerry's coach notes (timing/training context).",
-        "    image_prompt: a vivid one-line description that could be passed to an image model (overhead plate shot, daylight).",
-        "    foods[]: each entry must include item_id (from the catalog), food_name (the catalog title), weight_grams.",
-        "    source: \"kez_generated\".",
-        "",
-        itemsCatalog,
-        "",
-        `Generate exactly ${need} meals as JSON. Every meal must combine multiple catalog items.`,
-      ].join("\n");
-
-      try {
-        const raw = await callLlmText(userPrompt, { system: systemPrompt, json: true });
-        const jsonStr = extractJsonObject(raw) || raw;
-        const parsed = JSON.parse(jsonStr);
-        const extra = Array.isArray(parsed.meals) ? parsed.meals : [];
-
-        // Finalise all generated cards first so we know which prompts need
-        // images, then kick off image generation + Cloudinary upload for ALL
-        // of them in parallel — DALL-E is ~10s per image, doing them serially
-        // would push the carousel response past the user's patience window.
-        const finalisedCards = await Promise.all(
-          extra.slice(0, need).map((m) => finalizeGeneratedCard(m)),
-        );
-
-        const cardsWithImages = await Promise.all(
-          finalisedCards.map(async (card) => {
-            const url = await generateAndUploadMealImage(card);
-            if (url) card.image_url = url;
-            return card;
-          }),
-        );
-
-        for (const finalised of cardsWithImages) {
-          suggestions.push(finalised);
-
-          // Persist into the Brain Drafts queue (analyst can re-approve via the
-          // dedicated POST /save-suggestion endpoint or the existing drafts UI).
-          await query(
-            `INSERT INTO public.meal_carousel_draft (
-              analysis_id, student_id, mission_id, slot_id, payload, status, image_prompt
-            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`,
+        const vec = await embedQuery(queryText);
+        if (Array.isArray(vec) && vec.length) {
+          const k = Math.max(target_count * 6, 25);
+          const { rows } = await query(
+            `SELECT * FROM public.match_meals($1::vector, $2, $3::text[], $4, $5::bigint[])`,
             [
-              analysis?.id || null,
-              student_id,
-              mission_id,
-              slot_id,
-              jsonbString(finalised),
-              "pending",
-              finalised.image_prompt || null,
+              formatVectorLiteral(vec),
+              category || null,
+              dislikes,
+              k,
+              excludeMealIds,
             ],
           );
+          matchedRows = rows || [];
         }
       } catch (e) {
-        console.error("carousel gap fill", e);
+        console.error("[carousel] match_meals failed, will use fallback:", e.message || e);
       }
     }
+
+    // ── 3) Fallback: newest meals in the slot category (vector empty) ──────
+    // Triggered when match_meals returns nothing — usually because the
+    // embeddings haven't been backfilled yet or OpenAI is unreachable. Keeps
+    // the carousel rendering something usable instead of an empty screen.
+    let pooledIds = matchedRows.map((r) => Number(r.id)).filter((n) => Number.isFinite(n));
+    if (!pooledIds.length) {
+      pooledIds = await fetchFallbackMealIds(
+        category,
+        dislikes,
+        Math.max(target_count * 6, 25),
+        excludeMealIds,
+      );
+    }
+
+    // ── 4) Pick `target_count` meals with rank-weighted random sampling ────
+    //
+    // Why: pure ANN ranking is fully deterministic — same embedding always
+    // yields the same top-N → the coach sees the same 3 cards every click.
+    // We over-fetched a pool of ~6× target_count above, so we can sample
+    // `target_count` *without replacement* with weights ∝ 1 / (rank + 1).
+    //
+    // Effect:
+    //   • Top of the pool (most semantically relevant) is picked most
+    //     often, so the suggestions stay on-topic.
+    //   • Lower-ranked but still-relevant meals occasionally surface,
+    //     giving the carousel meaningful variety on each refresh.
+    //   • Combined with the V3-past exclude above, the same meal never
+    //     appears once the coach has sent it.
+    function sampleWeighted(ids, k) {
+      const pool = ids.slice();
+      const out = [];
+      while (pool.length && out.length < k) {
+        const weights = pool.map((_, i) => 1 / (i + 1));
+        const total = weights.reduce((a, b) => a + b, 0);
+        let r = Math.random() * total;
+        let idx = 0;
+        for (; idx < pool.length; idx += 1) {
+          r -= weights[idx];
+          if (r <= 0) break;
+        }
+        if (idx >= pool.length) idx = pool.length - 1;
+        out.push(pool[idx]);
+        pool.splice(idx, 1);
+      }
+      return out;
+    }
+
+    const chosenIds = sampleWeighted(pooledIds, Math.max(0, target_count));
+    const hydrated = chosenIds.length ? await loadLegacyMealsByIds(chosenIds) : [];
+    const suggestions = hydrated.map((meal) => legacyMealToCarouselCard(meal));
 
     res.json({
       suggestions,
@@ -1486,11 +1264,549 @@ async function saveSuggestionPost(req, res) {
   }
 }
 
+// =============================================================================
+// POST /api/kez/meal-analysis-v3
+// =============================================================================
+//
+// "Send to athlete" persistence for V3 picks. Unlike `mealAnalysisPost`
+// (which runs vision + LLM on a photo for V1/V2), this is a lightweight
+// write triggered when the coach selects a carousel/library meal to send
+// downstream. It records the pick as a `meal_analysis` row with
+// version='v3' so:
+//   • the side panel `GET /api/kez/meal-analysis` returns the V3 alongside
+//     V1/V2 on the next reload (kezBySlot in the dashboard);
+//   • the future `mealCarouselPost` calls for the same slot have an
+//     explicit V3 history row to consider; and
+//   • the V3 progression survives page reloads instead of living only in
+//     the dashboard's local `v3Slots` state.
+//
+// No vision, no LLM — the meal is already chosen, we just normalize the
+// macros against the prescreen-derived target band and persist.
+//
+// Body: {
+//   student_id, mission_id, slot_id, slot_label?,
+//   meal_id?,            // legacy meal pk if the card came from the DB
+//   title,               // required, becomes meal_text + feedback_text
+//   description?, blueprint_note?, image_url?, image_prompt?,
+//   foods?: Array<{ item_id?, food_name, weight_g?, energy_kj?,
+//                   protein_g?, carb_g?, fat_g? }>,
+//   totals?: { energy_kj?, protein_g?, carb_g?, fat_g? }
+// }
+async function mealAnalysisV3Post(req, res) {
+  try {
+    const body = req.body || {};
+    const {
+      student_id,
+      mission_id,
+      slot_id,
+      slot_label,
+      meal_id,
+      title,
+      description = "",
+      blueprint_note: blueprintNote = "",
+      image_url: imageUrlIn,
+      image_prompt: imagePromptIn,
+      foods: foodsIn,
+      totals: totalsIn,
+    } = body;
+
+    if (!student_id || !mission_id || !slot_id) {
+      return res.status(400).json({ error: "student_id, mission_id, slot_id required" });
+    }
+    if (!title || typeof title !== "string") {
+      return res.status(400).json({ error: "title required" });
+    }
+
+    const lbl = slot_label || slot_id;
+
+    const [{ rows: stRows }, { rows: prescreenRows }, { rows: eerRows }] = await Promise.all([
+      query(`SELECT id, full_name, first_name FROM public.students WHERE id = $1`, [student_id]),
+      query(`SELECT * FROM public.prescreen WHERE student_id = $1`, [student_id]),
+      query(`SELECT * FROM public.eer_config WHERE id = 1`),
+    ]);
+    if (!stRows?.[0]) return res.status(404).json({ error: "Student not found" });
+
+    const prescreen = prescreenRows?.[0] || {};
+    const eerRow = eerRows?.[0];
+    const eerConfig = eerRow
+      ? {
+          pal: eerRow.pal,
+          carb_gkg: eerRow.carb_gkg,
+          protein_gkg: eerRow.protein_gkg,
+          fat_gday: eerRow.fat_gday,
+        }
+      : {};
+
+    // load_day is NOT NULL CHECK ('Lower'|'Moderate'|'High') on the table —
+    // fall back to "Moderate" if prescreen can't be classified so the
+    // insert never fails the constraint.
+    const inferredLoad = classifyLoadFromPrescreen(prescreen);
+    const loadDay = inferredLoad || "Moderate";
+
+    const daily = computeDailyEER(prescreen, loadDay, eerConfig);
+    const fraction = mealFractionForSlot(lbl);
+    const targetBand = daily ? mealTargetBand(daily, fraction) : null;
+    const category = slotCategory(lbl);
+
+    // Resolve macro totals. Prefer client-supplied `totals` (the carousel
+    // already aggregates per-card); otherwise sum across foods.
+    const foods = Array.isArray(foodsIn) ? foodsIn : [];
+    const sumFromFoods = foods.reduce(
+      (acc, f) => ({
+        energy_kj: acc.energy_kj + (Number(f.energy_kj) || 0),
+        protein_g: acc.protein_g + (Number(f.protein_g) || 0),
+        carb_g: acc.carb_g + (Number(f.carb_g) || 0),
+        fat_g: acc.fat_g + (Number(f.fat_g) || 0),
+      }),
+      { energy_kj: 0, protein_g: 0, carb_g: 0, fat_g: 0 },
+    );
+    const raw = {
+      energy_kj: Number(totalsIn?.energy_kj) || sumFromFoods.energy_kj,
+      protein_g: Number(totalsIn?.protein_g) || sumFromFoods.protein_g,
+      carb_g: Number(totalsIn?.carb_g) || sumFromFoods.carb_g,
+      fat_g: Number(totalsIn?.fat_g) || sumFromFoods.fat_g,
+    };
+    const macro_totals = finalizeTotals(raw);
+    const vs_targets = targetBand ? buildVsTargets(macro_totals, targetBand) : {};
+
+    // Frontend uses `feedback_text` as the short slot description in the
+    // V1/V2/V3 progression strip. Keep it short and human.
+    const feedback_text = description
+      ? `${title} — ${description}`
+      : title;
+
+    const resolvedItems = foods.map((f) => ({
+      food_id: f.item_id || f.food_id || null,
+      food_name: f.food_name || "Ingredient",
+      grams_estimate: Number(f.weight_g ?? f.weight_grams) || null,
+      vision_confidence: null,
+      resolver_score: null,
+      food_row: null,
+      energy_kj: Number(f.energy_kj) || 0,
+      protein_g: Number(f.protein_g) || 0,
+      carb_g: Number(f.carb_g) || 0,
+      fat_g: Number(f.fat_g) || 0,
+    }));
+
+    const model_meta = {
+      route: "meal-analysis-v3",
+      source: meal_id ? "library_meal" : "carousel_card",
+      meal_id: meal_id != null ? Number(meal_id) || null : null,
+      slot_label: lbl,
+      blueprint_note: blueprintNote,
+      image_prompt: imagePromptIn || null,
+      foods,
+      totals: macro_totals,
+    };
+
+    const { rows: insRows } = await query(
+      `INSERT INTO public.meal_analysis (
+        student_id, mission_id, slot_id, version, image_url, meal_text,
+        load_day, category, vision_raw, resolved_items, macro_totals, target_band, vs_targets,
+        feedback_text, feedback_status, confidence, needs_correction, flags, model_meta
+      ) VALUES (
+        $1, $2, $3, 'v3', $4, $5, $6, $7,
+        $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb,
+        $13, 'approved', $14, false, $15, $16::jsonb
+      )
+      RETURNING id, created_at`,
+      [
+        student_id,
+        mission_id,
+        slot_id,
+        imageUrlIn || null,
+        title,
+        loadDay,
+        category,
+        jsonbString({}),
+        jsonbString(resolvedItems),
+        jsonbString(macro_totals),
+        jsonbString(targetBand),
+        jsonbString(vs_targets),
+        feedback_text,
+        1.0,
+        ["v3_manual_selection"],
+        jsonbString(model_meta),
+      ],
+    );
+
+    const inserted = insRows?.[0];
+    if (!inserted?.id) return res.status(500).json({ error: "Failed to save V3 selection" });
+
+    res.json({
+      ok: true,
+      analysis_id: inserted.id,
+      created_at: inserted.created_at,
+      category,
+      macro_totals,
+      target_band: targetBand,
+      vs_targets,
+    });
+  } catch (e) {
+    console.error("mealAnalysisV3Post", e);
+    res.status(500).json({ error: e.message || "Save V3 failed" });
+  }
+}
+
+// =============================================================================
+// POST /api/kez/mission-feedback-draft
+// =============================================================================
+//
+// Generates ONE personalized, mission-level coaching draft from "Virtual Kez"
+// (Kerry's persona, see MASTER_SYSTEM_PROMPT). Replaces the old behaviour
+// where the dashboard simply concatenated each slot's `feedback_text` —
+// which read more like a stitched-together report than a coach's note.
+//
+// Inputs collected server-side from canonical tables (no client trust):
+//   • `public.students`              — first name, age via prescreen.dob
+//   • `public.prescreen`             — sex, weight, height, dietary reqs,
+//                                       dislikes, free-text liked foods
+//   • `student_food_preferences`     — resolved list of liked items.title
+//   • `public.eer_config`            — PAL bands + g/kg defaults
+//   • `public.meal_analysis`         — ALL rows for (student, mission),
+//                                       grouped by slot, including v1, v2,
+//                                       AND v3 picks
+//
+// Output: one coherent draft (text), <= 3 short paragraphs, follows every
+// rule from the master persona (no bullets, food-first, "Hey [Name].",
+// never "healthy"/"unhealthy"). The same hard-stop / template / strip
+// post-processors used by `mealAnalysisPost` run here too so the output
+// stays inside the same guardrails.
+//
+// Body: { student_id, mission_id }
+async function missionFeedbackDraftPost(req, res) {
+  try {
+    const { student_id, mission_id } = req.body || {};
+    if (!student_id || !mission_id) {
+      return res.status(400).json({ error: "student_id, mission_id required" });
+    }
+
+    const [
+      { rows: stRows },
+      { rows: prescreenRows },
+      { rows: eerRows },
+      dbLikedFoods,
+      { rows: analysisRows },
+    ] = await Promise.all([
+      query(`SELECT id, full_name, first_name FROM public.students WHERE id = $1`, [student_id]),
+      query(`SELECT * FROM public.prescreen WHERE student_id = $1`, [student_id]),
+      query(`SELECT * FROM public.eer_config WHERE id = 1`),
+      likedFoodsForStudent(student_id),
+      query(
+        `SELECT slot_id, version, image_url, meal_text, category,
+                load_day, macro_totals, target_band, vs_targets,
+                feedback_text, confidence, needs_correction, flags,
+                created_at
+           FROM public.meal_analysis
+          WHERE student_id = $1 AND mission_id = $2
+          ORDER BY slot_id ASC, version ASC, created_at DESC`,
+        [student_id, mission_id],
+      ),
+    ]);
+
+    if (!stRows?.[0]) return res.status(404).json({ error: "Student not found" });
+    const prescreen = prescreenRows?.[0] || {};
+    const eerRow = eerRows?.[0];
+    const eerConfig = eerRow
+      ? {
+          pal: eerRow.pal,
+          carb_gkg: eerRow.carb_gkg,
+          protein_gkg: eerRow.protein_gkg,
+          fat_gday: eerRow.fat_gday,
+        }
+      : {};
+
+    const studentRow = stRows[0];
+    const firstName =
+      studentRow.first_name ||
+      String(studentRow.full_name || "Athlete").trim().split(/\s+/)[0] ||
+      "Athlete";
+
+    if (!analysisRows.length) {
+      // No analyses run yet → return a stub the dashboard can show without
+      // burning an LLM call. Same friendly nudge the frontend used to print.
+      return res.json({
+        draft:
+          `Hey ${firstName}. Run Kez analysis on the V1/V2 meal photos for ` +
+          `this mission first (button under each slot), then generate this ` +
+          `draft again so I can speak to what you actually ate.`,
+        used_analyses: 0,
+        empty_mission_analyses: true,
+      });
+    }
+
+    // Pick the freshest row per (slot, version) tuple. Same student can have
+    // multiple v1 attempts as they retake photos — we want the latest.
+    const latestBySlotVer = new Map();
+    for (const r of analysisRows) {
+      const key = `${r.slot_id}|${r.version}`;
+      if (!latestBySlotVer.has(key)) latestBySlotVer.set(key, r);
+    }
+
+    // Group by slot for the prompt so the model sees the V1 → V2 → V3
+    // progression for each meal slot side-by-side, matching how Kerry
+    // reviews missions in the dashboard.
+    const slotsMap = new Map();
+    for (const r of latestBySlotVer.values()) {
+      const slot = slotsMap.get(r.slot_id) || {
+        slot_id: r.slot_id,
+        category: r.category || null,
+        load_day: r.load_day || null,
+        v1: null,
+        v2: null,
+        v3: null,
+      };
+      if (!slot.category && r.category) slot.category = r.category;
+      if (!slot.load_day && r.load_day) slot.load_day = r.load_day;
+      slot[r.version] = {
+        meal_text: r.meal_text || "",
+        macro_totals: r.macro_totals || null,
+        target_band: r.target_band || null,
+        vs_targets: r.vs_targets || null,
+        confidence: r.confidence != null ? Number(r.confidence) : null,
+        needs_correction: !!r.needs_correction,
+        flags: Array.isArray(r.flags) ? r.flags : [],
+        feedback_text: r.feedback_text || "",
+      };
+      slotsMap.set(r.slot_id, slot);
+    }
+    const slots = Array.from(slotsMap.values());
+
+    const loadDay = classifyLoadFromPrescreen(prescreen);
+    const daily = computeDailyEER(prescreen, loadDay, eerConfig);
+    const dislikes = dislikeList(prescreen);
+
+    const facts = {
+      firstName,
+      age: ageFromDob(prescreen.dob),
+      sex: prescreen.sex || null,
+      weight_kg: prescreen.weight_kg ?? prescreen.weight ?? null,
+      height_cm: prescreen.height_cm ?? prescreen.height ?? null,
+      training_load_day: loadDay,
+      dietary_requirements:
+        prescreen.dietary_reqs || prescreen.dietaryReqs || "",
+      liked_foods: dbLikedFoods,
+      disliked_foods: dislikes,
+      daily_eer_kcal: daily ? [daily.eerLow, daily.eerHigh] : null,
+      daily_protein_g: daily?.protein || null,
+      daily_carb_g: daily?.carb || null,
+      mission_id,
+      slots,
+    };
+    const factsJson = JSON.stringify(facts, null, 2);
+
+    const userPrompt = [
+      `Current task: MISSION_FEEDBACK_DRAFT`,
+      ``,
+      `Write a single, personalized coaching note from Kerry to ${firstName} ` +
+        `for this mission. Use the FACTS below as the only source of truth ` +
+        `— do not invent numbers, brands, or food choices.`,
+      ``,
+      `What to cover (in order, but use Kerry's voice — no headings, no ` +
+        `bullets, plain prose):`,
+      `  1. Read across V1 → V2 (and V3 where present) for each slot and ` +
+        `name what actually shifted. Acknowledge real improvements.`,
+      `  2. Connect the changes to ${firstName}'s training load ` +
+        `(FACTS.training_load_day) and daily fuel targets ` +
+        `(FACTS.daily_eer_kcal, FACTS.daily_protein_g, FACTS.daily_carb_g).`,
+      `  3. Give 2–3 specific, actionable nudges built ONLY from ` +
+        `FACTS.liked_foods. Never recommend something in ` +
+        `FACTS.disliked_foods or contrary to FACTS.dietary_requirements.`,
+      `  4. Close with one concrete next step.`,
+      ``,
+      `Hard format rules (non-negotiable):`,
+      `  - Open with: "Hey ${firstName}."`,
+      `  - Maximum 3 short paragraphs. NO bullet points. NO headings.`,
+      `  - Address ${firstName} as "you" throughout.`,
+      `  - Never use the words "healthy" or "unhealthy".`,
+      `  - Show energy as "X cal (Y kJ)" when referencing a number; round ` +
+        `cal to nearest 10, kJ to nearest 100.`,
+      `  - If a number is missing in FACTS, do not fabricate one — say what ` +
+        `you'd need to know.`,
+      ``,
+      `FACTS (JSON):`,
+      factsJson,
+    ].join("\n");
+
+    let draft = "";
+    try {
+      draft = await callLlmText(userPrompt, {
+        system: MASTER_SYSTEM_PROMPT,
+        json: false,
+      });
+    } catch (e) {
+      console.error("missionFeedbackDraftPost LLM error", e);
+      return res.status(502).json({
+        error: "LLM call failed",
+        detail: e.message || String(e),
+      });
+    }
+
+    const stopped = applyHardStopTemplates(draft, { firstName });
+    draft = stopped.text;
+    draft = stripHealthyUnhealthy(draft);
+
+    res.json({
+      draft,
+      first_name: firstName,
+      used_analyses: latestBySlotVer.size,
+      slot_count: slots.length,
+      hard_stop_triggered: !!stopped.flagged,
+    });
+  } catch (e) {
+    console.error("missionFeedbackDraftPost", e);
+    res.status(500).json({ error: e.message || "Draft generation failed" });
+  }
+}
+
+// =============================================================================
+// POST /api/kez/student-feedback-draft
+// =============================================================================
+//
+// Athlete-level overall coaching note (was `genMainAI` in DashboardClient —
+// prompt built in the browser + POST to Next `/api/ai-draft`). Now the entire
+// pipeline lives here: prescreen + food prefs + EER-derived daily targets,
+// Virtual Kez persona (`MASTER_SYSTEM_PROMPT`), same guardrail post-processors.
+//
+// Body: { student_id }
+async function studentFeedbackDraftPost(req, res) {
+  try {
+    const { student_id } = req.body || {};
+    if (!student_id) return res.status(400).json({ error: "student_id required" });
+
+    const normArr = (val) => {
+      if (Array.isArray(val)) return val.map(String).map((s) => s.trim()).filter(Boolean);
+      if (val == null || val === "") return [];
+      return [String(val).trim()].filter(Boolean);
+    };
+
+    const [{ rows: stRows }, { rows: prescreenRows }, { rows: eerRows }, dbLikedFoods] = await Promise.all([
+      query(`SELECT id, full_name, first_name FROM public.students WHERE id = $1`, [student_id]),
+      query(`SELECT * FROM public.prescreen WHERE student_id = $1`, [student_id]),
+      query(`SELECT * FROM public.eer_config WHERE id = 1`),
+      likedFoodsForStudent(student_id),
+    ]);
+
+    if (!stRows?.[0]) return res.status(404).json({ error: "Student not found" });
+    const ps = prescreenRows?.[0] || {};
+    const eerRow = eerRows?.[0];
+    const eerConfig = eerRow
+      ? {
+          pal: eerRow.pal,
+          carb_gkg: eerRow.carb_gkg,
+          protein_gkg: eerRow.protein_gkg,
+          fat_gday: eerRow.fat_gday,
+        }
+      : {};
+
+    const studentRow = stRows[0];
+    const firstName =
+      studentRow.first_name ||
+      String(studentRow.full_name || "Athlete").trim().split(/\s+/)[0] ||
+      "Athlete";
+
+    const loadDay = classifyLoadFromPrescreen(ps);
+    const daily = computeDailyEER(ps, loadDay, eerConfig);
+    const dislikes = dislikeList(ps);
+
+    const facts = {
+      firstName,
+      full_name: studentRow.full_name || null,
+      age: ageFromDob(ps.dob),
+      sex: ps.sex || null,
+      height_cm: ps.height_cm ?? ps.height ?? null,
+      weight_kg: ps.weight_kg ?? ps.weight ?? null,
+      training_load_day: loadDay,
+      training_days_per_week: {
+        high: Number(ps.days_high ?? ps.daysHigh) || 0,
+        moderate: Number(ps.days_med ?? ps.daysMed) || 0,
+        low: Number(ps.days_low ?? ps.daysLow) || 0,
+      },
+      goals: normArr(ps.goals),
+      biggest_challenges: normArr(ps.biggest_challenges ?? ps.biggestChallenges),
+      medical: normArr(ps.medical),
+      activity_type: normArr(ps.activity_type ?? ps.activityType),
+      supplements: ps.supplements || null,
+      fav_foods_free_text: ps.fav_foods || ps.favFoods || null,
+      liked_foods: dbLikedFoods,
+      disliked_foods: dislikes,
+      dietary_requirements: ps.dietary_reqs || ps.dietaryReqs || "",
+      daily_eer_kcal: daily ? [daily.eerLow, daily.eerHigh] : null,
+      daily_protein_g: daily?.protein || null,
+      daily_carb_g: daily?.carb || null,
+    };
+    const factsJson = JSON.stringify(facts, null, 2);
+
+    const userPrompt = [
+      `Current task: STUDENT_OVERALL_FEEDBACK_DRAFT`,
+      ``,
+      `Write one overall coaching feedback note from Kerry to ${firstName}. ` +
+        `Use the FACTS JSON below as the only source of truth — do not invent ` +
+        `numbers, brands, medical diagnoses, or foods not implied by FACTS.`,
+      ``,
+      `What to cover (in Kerry's voice — no headings, no bullets, plain prose):`,
+      `  1. Acknowledge where they are today using their goals, challenges, ` +
+        `and training week pattern (FACTS.training_days_per_week, ` +
+        `FACTS.training_load_day).`,
+      `  2. Connect fueling to their daily energy and macro band ` +
+        `(FACTS.daily_eer_kcal, FACTS.daily_protein_g, FACTS.daily_carb_g) ` +
+        `when those numbers exist.`,
+      `  3. Give 2–3 specific, actionable improvements built ONLY from ` +
+        `FACTS.liked_foods (and FACTS.fav_foods_free_text if present). ` +
+        `Never recommend anything in FACTS.disliked_foods or contrary to ` +
+        `FACTS.dietary_requirements. If FACTS.medical lists conditions, stay ` +
+        `general — encourage seeing a clinician — never diagnose.`,
+      `  4. Close with one concrete next step.`,
+      ``,
+      `Hard format rules (non-negotiable):`,
+      `  - Open with: "Hey ${firstName}."`,
+      `  - Under 200 words total. Maximum 3 short paragraphs. NO bullet points. NO headings.`,
+      `  - Address ${firstName} as "you" throughout.`,
+      `  - Never use the words "healthy" or "unhealthy".`,
+      `  - Show energy as "X cal (Y kJ)" when referencing a number; round cal ` +
+        `to nearest 10, kJ to nearest 100.`,
+      ``,
+      `FACTS (JSON):`,
+      factsJson,
+    ].join("\n");
+
+    let draft = "";
+    try {
+      draft = await callLlmText(userPrompt, {
+        system: MASTER_SYSTEM_PROMPT,
+        json: false,
+      });
+    } catch (e) {
+      console.error("studentFeedbackDraftPost LLM error", e);
+      return res.status(502).json({
+        error: "LLM call failed",
+        detail: e.message || String(e),
+      });
+    }
+
+    const stopped = applyHardStopTemplates(draft, { firstName });
+    draft = stopped.text;
+    draft = stripHealthyUnhealthy(draft);
+
+    res.json({
+      draft,
+      first_name: firstName,
+      hard_stop_triggered: !!stopped.flagged,
+    });
+  } catch (e) {
+    console.error("studentFeedbackDraftPost", e);
+    res.status(500).json({ error: e.message || "Draft generation failed" });
+  }
+}
+
 module.exports = {
   mealAnalysisGet,
   mealAnalysisPost,
+  mealAnalysisV3Post,
   mealCarouselPost,
   mealCarouselDraftsGet,
   mealCarouselDraftsPost,
+  missionFeedbackDraftPost,
+  studentFeedbackDraftPost,
   saveSuggestionPost,
 };

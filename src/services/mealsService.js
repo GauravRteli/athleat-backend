@@ -12,6 +12,7 @@
 // =============================================================================
 
 const { pool, query } = require("../config/postgres");
+const { embedMealAndStore } = require("./mealEmbeddings");
 
 const num = (v) => {
   if (v === null || v === undefined || v === "") return null;
@@ -567,6 +568,13 @@ async function createMeal(payload) {
     if (foods.length) await replaceMealFoods(client, meal.id, foods);
     await replaceMealJoins(client, meal.id, payload);
 
+    // Generate + store the pgvector embedding so the new meal is immediately
+    // searchable via `match_meals`. `embedMealAndStore` swallows OpenAI
+    // failures internally and returns false — we never roll back a legitimate
+    // meal write because of a flaky embedding call. Backfill will pick up
+    // any meal still missing an embedding.
+    await embedMealAndStore(client, meal.id);
+
     // Hydrate inside the same transaction to avoid a fresh pool connection
     // (and a window where the new meal isn't yet visible to other readers).
     const shaped = await getMealById(meal.id, client);
@@ -620,6 +628,11 @@ async function updateMeal(id, payload) {
       await replaceMealFoods(client, id, payload.foods);
     }
     await replaceMealJoins(client, id, payload);
+
+    // Re-embed on update so any change to title / description / categories /
+    // sub-categories / tags / ingredients keeps the pgvector row in sync.
+    // Failure path is identical to createMeal — swallowed, never rolls back.
+    await embedMealAndStore(client, id);
 
     // Hydrate inside the same transaction (saves a connection acquire).
     const shaped = await getMealById(id, client);

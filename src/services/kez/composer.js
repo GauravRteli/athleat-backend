@@ -3,7 +3,6 @@ const { query } = require("../../config/postgres");
 const {
   MASTER_SYSTEM_PROMPT,
   MEAL_ANALYSIS_TASK_SUFFIX,
-  V3_CAROUSEL_TASK_SUFFIX,
 } = require("./masterPrompt");
 
 const TTL_MS = 60_000;
@@ -110,21 +109,8 @@ function mealAnalysisUserPrompt({ firstName, factsJson }) {
   ].join("\n");
 }
 
-function v3CarouselUserPrompt({ firstName, factsJson, verifiedMealsSummary }) {
-  return [
-    V3_CAROUSEL_TASK_SUFFIX.replace(/\[FirstName\]/g, firstName || "there"),
-    "",
-    "ATHLETE & CONTEXT:",
-    factsJson,
-    "",
-    "VERIFIED MEALS CANDIDATES (prefer these when you can — use exact totals if you choose one):",
-    verifiedMealsSummary || "(none — generate performance meals with Coles/Woolworths foods only)",
-  ].join("\n");
-}
-
 module.exports = {
   buildBrainInjection,
   assembleMealAnalysisSystemPrompt,
   mealAnalysisUserPrompt,
-  v3CarouselUserPrompt,
 };

@@ -1,0 +1,338 @@
+================================================================================
+PHASE 1 — pgvector setup for the meals table (analysis & explanation)
+Owner: Gaurav   ·   Est: 1 hour
+================================================================================
+
+WHO THIS IS FOR
+---------------
+You (Gaurav) are about to enable vector search on the `meals` table so that
+later phases (2 = backfill embeddings, 3 = wire it into the Brain tab + Kez's
+meal carousel) have something to query against. This document explains:
+
+  1. WHY we are doing this in the first place.
+  2. WHAT the blueprint SQL would do if it ran exactly as written.
+  3. WHY the blueprint SQL will FAIL against our actual schema.
+  4. A drop-in rewrite of 1.1 / 1.2 / 1.3 that matches our real schema.
+  5. The acceptance checks for handing off to Hitish (Phase 2).
+
+
+--------------------------------------------------------------------------------
+1) WHY are we doing this?
+--------------------------------------------------------------------------------
+
+Today, when Kez needs to suggest meals (V3 carousel / "what should Sam eat for
+breakfast tomorrow?"), the backend pulls meals from `public.meals` using:
+
+  - keyword ILIKE on the title
+  - an exact category join (meal_category -> public.categories)
+  - optional ingredient filter via item_meals
+
+That works, but it cannot answer fuzzy intent like:
+
+  "post-training protein-rich meal Sam will actually eat,
+   high in carbs, no peanuts, similar in style to her favourites."
+
+Vector search fixes that. Each meal gets an embedding (a 1536-dim float vector
+describing its title/description/tags/category in vector space). When we have a
+query — derived from the athlete's preferences, the slot they're on, etc. — we
+embed THAT query the same way and ask Postgres for the meals whose vectors are
+closest.
+
+The pattern we're following is the same one we already use for the knowledge
+base (RAG / Virtual Kez):
+
+  KNOWLEDGE BASE                            MEALS (new in Phase 1)
+  -------------------                       -----------------------
+  public.knowledge_chunks                   public.meals
+    embedding vector(1024)                    embedding vector(1536)
+    + HNSW index                              + HNSW index
+    + RPC: match_knowledge_chunks(...)        + RPC: match_meals(...)
+
+So Phase 1 is *only* infra:
+  - turn on the vector extension (no-op if already on)
+  - add an `embedding` column on `meals`
+  - add an HNSW index so cosine search is sub-millisecond
+  - add a stored function `match_meals(...)` the app can call as one RPC
+
+Phase 2 (Hitish) will fill the column. Phase 3 wires it into the Brain tab and
+Kez. None of that is in your lane — you only need 1.1, 1.2, 1.3.
+
+
+--------------------------------------------------------------------------------
+2) WHAT the blueprint SQL would do if it ran exactly as written
+--------------------------------------------------------------------------------
+
+The blueprint hands you three SQL blocks (1.1, 1.2, 1.3). Conceptually:
+
+  1.1  CREATE EXTENSION vector;          -- turn on pgvector
+       ALTER TABLE meals ADD COLUMN embedding vector(1536);
+       CREATE INDEX meals_embedding_idx ON meals USING hnsw ...;
+
+  1.2  CREATE OR REPLACE FUNCTION match_meals(query_embedding, meal_category,
+                                              disliked_foods, match_count)
+         RETURNS TABLE(id, title, description, protein_g, carb_g, fat_g,
+                       energy_kj, tags)
+         -- filter by category text equality
+         -- exclude rows where title ILIKE ANY (disliked_foods)
+         -- order by embedding <=> query_embedding
+         -- limit match_count;
+
+  1.3  test call with a dummy 1536-dim vector and a hardcoded category.
+
+
+--------------------------------------------------------------------------------
+3) WHY 1.2 / 1.3 will FAIL on our real schema (this is the important bit)
+--------------------------------------------------------------------------------
+
+Step 1.1 is fine. The `vector` extension exists (we already use it for
+`knowledge_chunks` at 1024 dim). Adding `vector(1536)` on `meals` and an HNSW
+index on it are no problem — they don't conflict with the 1024 dim used by the
+RAG table because each column declares its own dim independently.
+
+Step 1.2 and 1.3 — as written — assume `public.meals` looks like this:
+
+  meals(id, title, description, category, protein_g, carb_g,
+        fat_g, energy_kj, tags, is_active, embedding)
+
+But the actual `public.meals` in this DB is the LEGACY shape (see Schema.txt
+line 133):
+
+  meals(id          bigserial,
+        title       varchar(255),
+        image       varchar(255),
+        description text,
+        note        text,
+        user_id     bigint,
+        created_at  timestamp,
+        updated_at  timestamp)
+
+Notice what's missing:
+
+  - NO  meals.category          -> categories live in
+                                   meal_category -> public.categories
+  - NO  meals.is_active         -> all rows are treated as active
+  - NO  meals.protein_g/carb_g/fat_g/energy_kj
+                                -> macros are aggregated from item_meals at
+                                   read time (see backend/src/services/mealsService.js)
+  - NO  meals.tags              -> tags live in meal_tag -> public.tags
+
+So the function body in 1.2 references four columns that don't exist
+(`category`, `is_active`, the four macro columns, `tags`) and the RETURNS TABLE
+shape also references the four macros + `tags`. If you paste it as-is, Supabase
+will throw:
+
+  ERROR: column "category" does not exist
+  ERROR: column "is_active" does not exist
+  ERROR: column "protein_g" does not exist
+  ...
+
+And the test SELECT in 1.3 will succeed in *signature* but return nothing
+meaningful until the function runs.
+
+We have two ways to fix it. Pick ONE before running 1.2:
+
+  OPTION A (recommended)
+  ----------------------
+  Keep the legacy meals table normalised. Rewrite the RPC to JOIN to
+  meal_category / categories / meal_tag / item_meals at query time. This is
+  the cheapest change and matches how mealsService.js already reads meals.
+  Macros come back as numeric aggregates. The signature stays the same so
+  Phase 2 / Phase 3 code does not change.
+
+  OPTION B
+  --------
+  Materialise a denormalised meals view or computed columns
+  (category text, protein_g numeric, carb_g numeric, fat_g numeric,
+  energy_kj numeric, tags text[], is_active boolean default true) so the
+  blueprint SQL can run as-is. More work, more places to keep in sync, more
+  things that can drift. Not worth it just for the RPC.
+
+This document assumes OPTION A. Use the SQL in section 4 below.
+
+ONE MORE THING WORTH FLAGGING
+
+The blueprint uses `vector(1536)` (OpenAI `text-embedding-3-small`). Our
+existing RAG table uses `vector(1024)` (`text-embedding-3-large` with
+`dimensions: 1024`, see backend/sql/2026_05_09_pgvector_knowledge_chunks.sql).
+That is fine — each column declares its own dim. But it means Phase 2 MUST use
+`text-embedding-3-small` (1536 dim) when embedding meals; if Hitish accidentally
+uses a 1024-dim model the inserts will fail with a dim-mismatch error. Worth a
+heads-up in the handoff.
+
+
+--------------------------------------------------------------------------------
+4) THE SQL TO ACTUALLY RUN (paste into Supabase SQL editor, one block at a time)
+--------------------------------------------------------------------------------
+
+------ 1.1  Enable extension + add column + add index --------------------------
+
+  CREATE EXTENSION IF NOT EXISTS vector;
+
+  ALTER TABLE public.meals
+    ADD COLUMN IF NOT EXISTS embedding vector(1536);
+
+  CREATE INDEX IF NOT EXISTS meals_embedding_idx
+    ON public.meals
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+Notes:
+  - Idempotent. Re-running these three statements is safe.
+  - HNSW is the same setup we use for knowledge_chunks. m=16 / ef_construction=64
+    is pgvector's recommended default for <= 1M vectors. We have ~hundreds.
+  - The index will be empty until Phase 2 backfills embeddings. That's OK.
+
+
+------ 1.2  Re-implement match_meals to match our actual schema ----------------
+
+  DROP FUNCTION IF EXISTS public.match_meals(vector, text, text[], integer);
+
+  CREATE OR REPLACE FUNCTION public.match_meals(
+    query_embedding vector(1536),
+    meal_category   text,
+    disliked_foods  text[]  DEFAULT '{}',
+    match_count     integer DEFAULT 25
+  )
+  RETURNS TABLE (
+    id          bigint,
+    title       text,
+    description text,
+    protein_g   numeric,
+    carb_g      numeric,
+    fat_g       numeric,
+    energy_kj   numeric,
+    tags        text[],
+    score       double precision
+  )
+  LANGUAGE sql STABLE
+  AS $$
+    SELECT
+      m.id,
+      m.title::text,
+      m.description::text,
+
+      -- Macros aggregated from public.item_meals (same as mealsService.js)
+      COALESCE(SUM(im.protein), 0)::numeric AS protein_g,
+      COALESCE(SUM(im.carbs),   0)::numeric AS carb_g,
+      COALESCE(SUM(im.fat),     0)::numeric AS fat_g,
+      COALESCE(
+        SUM(
+          CASE
+            WHEN im.energy ~ '-?[0-9]+(\.[0-9]+)?'
+              THEN (regexp_match(im.energy, '-?[0-9]+(\.[0-9]+)?'))[1]::numeric
+            ELSE 0
+          END
+        ),
+        0
+      )::numeric AS energy_kj,
+
+      -- Tag names from public.meal_tag -> public.tags
+      COALESCE(
+        (
+          SELECT array_agg(t.name ORDER BY t.name)
+          FROM public.meal_tag mt
+          JOIN public.tags t ON t.id = mt.tag_id
+          WHERE mt.meal_id = m.id
+        ),
+        ARRAY[]::text[]
+      ) AS tags,
+
+      -- Cosine similarity (1.0 = identical, 0.0 = orthogonal) so we mirror
+      -- the convention match_knowledge_chunks already returns.
+      (1 - (m.embedding <=> query_embedding))::double precision AS score
+
+    FROM public.meals m
+    LEFT JOIN public.item_meals im ON im.meal_id = m.id
+
+    WHERE
+      m.embedding IS NOT NULL
+
+      -- Meal-time category match via meal_category -> public.categories.title
+      AND EXISTS (
+        SELECT 1
+        FROM public.meal_category mc
+        JOIN public.categories c ON c.id = mc.category_id
+        WHERE mc.meal_id = m.id
+          AND LOWER(c.title) = LOWER(meal_category)
+      )
+
+      -- Hard-exclude: if any disliked food string appears in the title, drop it
+      AND NOT (
+        m.title ILIKE ANY (
+          SELECT '%' || x || '%' FROM unnest(disliked_foods) AS x
+        )
+      )
+
+    GROUP BY m.id, m.title, m.description, m.embedding
+    ORDER BY m.embedding <=> query_embedding
+    LIMIT GREATEST(match_count, 1);
+  $$;
+
+Notes:
+  - Function name + parameter list match the blueprint, so Phase 2/3 code can
+    call match_meals(...) exactly as the doc describes.
+  - We added `score` to the return shape because we already do this on the RAG
+    side and the chat formatter expects it. Phase 3 can ignore it if needed.
+  - `m.embedding IS NOT NULL` lets you run this safely before Phase 2 finishes
+    (it just returns 0 rows until embeddings exist instead of returning random
+    junk).
+  - `LOWER(c.title) = LOWER(meal_category)` so the caller can pass "Breakfast",
+    "breakfast", "BREAKFAST" interchangeably (matches the UI behaviour).
+  - The disliked-foods filter is a hard exclude — same semantic as the blueprint.
+    Long term we may want to also exclude by item link (item_meals -> items), but
+    that is Phase 3 territory.
+
+
+------ 1.3  Verify match_meals works (will return 0 rows pre-Phase 2) ----------
+
+  SELECT id, title, score
+  FROM public.match_meals(
+    array_fill(0.1, ARRAY[1536])::vector,
+    'Breakfast',
+    ARRAY['peanuts'],
+    5
+  );
+
+What "success" looks like AT THIS POINT:
+
+  - No SQL error.
+  - 0 rows returned. That's expected — `m.embedding IS NOT NULL` filters out
+    every row because Phase 2 hasn't run yet.
+
+After Phase 2 (Hitish) runs the backfill, re-run this same query. You should
+see up to 5 Breakfast meals back, in some order (the dummy 0.1 vector is
+identical-distance to everything, so order will be arbitrary but the row count
+should be right).
+
+Screenshot for Hitish: either the "Query returned successfully with no result"
+panel (pre-Phase-2) or the rowset (post-Phase-2). Either is fine to confirm
+the function is callable.
+
+
+--------------------------------------------------------------------------------
+5) Hand-off checklist
+--------------------------------------------------------------------------------
+
+  [ ] Ran 1.1 SQL — no errors. Confirm `embedding` column exists on meals.
+        SELECT column_name, data_type FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='meals' AND column_name='embedding';
+
+  [ ] Ran 1.2 SQL — no errors. Confirm function exists.
+        SELECT proname FROM pg_proc WHERE proname = 'match_meals';
+
+  [ ] Ran 1.3 test — no errors. 0 rows is the expected pre-backfill output.
+
+  [ ] Confirmed `match_knowledge_chunks` still works:
+        SELECT id FROM public.match_knowledge_chunks(
+          array_fill(0.1, ARRAY[1024])::vector, 3
+        );
+        (returns up to 3 rows if anything is in knowledge_chunks)
+
+  [ ] Pinged Hitish with:
+        - Screenshot of the 1.3 result panel.
+        - Reminder to use `text-embedding-3-small` (1536 dim) in Phase 2.
+        - This file for context.
+
+================================================================================
+End of phase 1 notes
+================================================================================

@@ -7,6 +7,7 @@ const {
   getFoodPrefsCatalog,
 } = require("../services/athleteService");
 const { submitMissionVersion } = require("../services/studentService");
+const { getMissionConfig } = require("../services/missionConfigService");
 
 async function getMe(req, res, next) {
   try {
@@ -68,6 +69,16 @@ async function getMissions(req, res, next) {
   }
 }
 
+/** Public mission copy (names, unlock hints, slot labels) — same rows Kerry edits in Admin. */
+async function getMissionConfigForAthlete(req, res, next) {
+  try {
+    const data = await getMissionConfig();
+    return res.status(200).json({ data });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 async function postSubmitMissionV1(req, res, next) {
   try {
     const missionId = String(req.params?.missionId || "").trim().toLowerCase();
@@ -105,6 +116,7 @@ module.exports = {
   postFoodPreferences,
   getFoodPreferencesCatalog,
   getMissions,
+  getMissionConfigForAthlete,
   postSubmitMissionV1,
   postSubmitMissionV2,
 };
