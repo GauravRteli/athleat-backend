@@ -139,6 +139,7 @@ function shapeSources(matches) {
 }
 
 async function chatTurn({ messages, topK, studentFirstName }) {
+  console.log(env.openai.apiKey, env.anthropic.apiKey);
   if (!env.openai.apiKey) {
     throw Object.assign(new Error("OPENAI_API_KEY not configured (required for RAG embeddings)"), { status: 503 });
   }

@@ -16,6 +16,8 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
+
+// 
 app.use(express.json({ limit: "50mb" }));
 // Skip the chatty knowledge-entries polling endpoint from the request log so
 // the [rag][indexer …] tracking lines stay readable. Other endpoints log
