@@ -38,6 +38,10 @@ const env = {
   anthropic: {
     apiKey: process.env.ANTHROPIC_API_KEY || "",
     model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
+    /** Brain / knowledge-base RAG reply model (Messages API). */
+    ragChatModel:
+      process.env.ANTHROPIC_RAG_CHAT_MODEL || "claude-sonnet-4-20250514",
+    ragMaxOutputTokens: Number(process.env.ANTHROPIC_RAG_MAX_TOKENS || 1000),
   },
   rag: {
     chunkSize: Number(process.env.RAG_CHUNK_SIZE || 800),

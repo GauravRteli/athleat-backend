@@ -2,11 +2,11 @@ const { chatTurn } = require("../services/rag/chat");
 
 async function postTestChat(req, res, next) {
   try {
-    const { messages, topK } = req.body || {};
+    const { messages, topK, studentFirstName } = req.body || {};
     if (!Array.isArray(messages) || !messages.length) {
       return res.status(400).json({ message: "messages[] is required" });
     }
-    const result = await chatTurn({ messages, topK });
+    const result = await chatTurn({ messages, topK, studentFirstName });
     return res.status(200).json(result);
   } catch (error) {
     if (error.status && error.status >= 400 && error.status < 600) {
