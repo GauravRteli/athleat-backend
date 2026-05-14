@@ -11,6 +11,7 @@ async function bootstrap() {
   } catch (error) {
     console.error("Initial DB connection failed:", error.message);
   }
+  // 
 
   // Verify pgvector + knowledge_chunks table are present.  This is cheap
   // (two metadata queries) so we always run it; missing extension/table
