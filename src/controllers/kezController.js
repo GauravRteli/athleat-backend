@@ -28,7 +28,7 @@ const {
 } = require("../services/kez/validators");
 const { formatCarouselMacros } = require("../services/kez/format");
 const { resolveMealImageUrlForVision } = require("../services/kez/missionImageUrl");
-const { uploadRemoteUrl } = require("../services/uploadService");
+const { uploadRemoteUrl, uploadImage } = require("../services/uploadService");
 const mealsService = require("../services/mealsService");
 const { embedQuery } = require("../services/rag/embeddings");
 const {
@@ -37,57 +37,214 @@ const {
 } = require("../services/mealEmbeddings");
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || "dall-e-3";
+// `gpt-image-1` is OpenAI's current flagship image model — best quality and
+// best instruction-following for food photography. Override with env var to
+// force `dall-e-3` / `dall-e-2` if needed.
+const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || "gpt-image-1";
+const OPENAI_IMAGES_URL = "https://api.openai.com/v1/images/generations";
 
-// Build the production image prompt for a V3 carousel card. Keeps tone /
-// styling consistent between auto-generated images (carousel) and re-saved
-// images (POST /save-suggestion).
-function buildMealImagePrompt({ title, description, image_prompt }) {
+// Build the production image prompt for a meal card (carousel, save, or
+// POST /generate-meal-image). Uses optional `foods[]` for ingredient-grounded
+// visuals. Keep under ~4k chars for DALL-E 3.
+function buildMealImagePrompt({
+  title,
+  description,
+  blueprint_note: blueprintSnake,
+  blueprintNote,
+  image_prompt,
+  foods,
+  slot_id: slotId,
+  slot_label: slotLabelSnake,
+  slotLabel,
+}) {
+  const desc =
+    String(description || "").trim() ||
+    String(blueprintNote || blueprintSnake || "").trim();
+  const slotHint = String(slotLabel || slotLabelSnake || slotId || "").trim();
+
+  const foodLines = (Array.isArray(foods) ? foods : [])
+    .map((f) => {
+      if (!f || typeof f !== "object") return "";
+      const nm = String(f.food_name || f.name || f.title || "").trim();
+      if (!nm) return "";
+      const w = f.weight_g ?? f.weight_grams ?? f.grams_estimate;
+      const wg = w != null && Number.isFinite(Number(w)) ? Math.round(Number(w)) : null;
+      return wg ? `${nm} (~${wg} g)` : nm;
+    })
+    .filter(Boolean)
+    .slice(0, 14);
+
+  const ingredientsPhrase =
+    foodLines.length > 0
+      ? `The dish clearly includes these ingredients, visibly recognizable: ${foodLines.join("; ")}.`
+      : "";
+
+  const cat = slotHint ? slotCategory(slotHint) : null;
+  const categoryPhrase = cat ? `Meal type: ${cat} — composition should match typical ${cat.toLowerCase()} fueling.` : "";
+
   const seed =
-    image_prompt ||
-    `Bright, appetising overhead photo of ${title || "an athlete meal"}. ${description || ""}`.trim();
-  return `${seed}. Plate on light wood, natural daylight, performance nutrition style. No text, no logos.`;
+    String(image_prompt || "").trim() ||
+    [
+      title && `Main meal: ${String(title).trim()}.`,
+      desc && `How it should look: ${String(desc).slice(0, 420)}`,
+      ingredientsPhrase,
+      categoryPhrase,
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+  const core = seed.trim() || "Balanced performance-nutrition meal on a ceramic plate, colourful whole foods.";
+
+  const style =
+    "Photorealistic editorial food photograph, 50mm lens, shallow depth of field, soft natural daylight from the side, neutral linen or light wood surface, simple ceramic plate, subtle steam only if realistic. Rich colour, crisp textures, appetising presentation. No text, no logos, no brand packaging, no watermark, no people, no hands.";
+
+  const full = `${core} ${style}`.replace(/\s+/g, " ").trim();
+  return full.length > 3800 ? full.slice(0, 3800) : full;
 }
 
-// Generate an image for a V3 suggestion via OpenAI's image API. Returns the
-// remote URL (Cloudinary upload happens in the calling endpoint).
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAI Images: model-aware request builder
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// OpenAI's `/v1/images/generations` endpoint behaves differently per model:
+//
+//   • gpt-image-1 (current flagship)
+//       - Returns `b64_json` (never `url`).
+//       - Quality values: "low" | "medium" | "high" | "auto".
+//       - Size values: "1024x1024" | "1024x1536" | "1536x1024" | "auto".
+//       - DOES NOT accept `response_format` — sending it returns 400.
+//
+//   • dall-e-3
+//       - Returns `url` by default; `response_format` is deprecated.
+//       - Quality values: "standard" | "hd".
+//       - Size values: "1024x1024" | "1024x1792" | "1792x1024".
+//
+//   • dall-e-2
+//       - Returns `url` by default.
+//       - No quality parameter.
+//
+// To stay forward-compatible we NEVER send `response_format` and instead
+// parse whichever shape comes back (`url` OR `b64_json`).
+function buildImageRequestBody(prompt) {
+  const model = String(OPENAI_IMAGE_MODEL || "gpt-image-1");
+  const isDalle3 = /dall-e-3/i.test(model);
+  const isDalle2 = /dall-e-2/i.test(model);
+  const isGptImage = /gpt-image/i.test(model);
+
+  const body = {
+    model,
+    prompt,
+    n: 1,
+    size: "1024x1024",
+  };
+  if (isGptImage) {
+    body.quality = "high";
+  } else if (isDalle3) {
+    body.quality = "hd";
+    body.style = "natural";
+  } else if (isDalle2) {
+    // no quality / style fields supported
+  }
+  return body;
+}
+
+function pickImageFromResponse(data) {
+  const item = data?.data?.[0];
+  if (!item) return null;
+  if (item.url && /^https?:\/\//i.test(item.url)) return item.url;
+  if (item.b64_json) return `data:image/png;base64,${item.b64_json}`;
+  return null;
+}
+
+// Call OpenAI Images. Returns either an https URL (dall-e-*) or a
+// `data:image/png;base64,...` data URL (gpt-image-1). Throws on error so the
+// caller can surface a useful message; returns null only if no payload.
 async function generateMealImageUrl(prompt) {
-  if (!OPENAI_API_KEY || !prompt) return null;
-  const res = await fetch("https://api.openai.com/v1/images/generations", {
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured");
+  if (!prompt || !String(prompt).trim()) throw new Error("Empty image prompt");
+
+  const requestBody = buildImageRequestBody(String(prompt).slice(0, 3800));
+
+  const res = await fetch(OPENAI_IMAGES_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({
-      model: OPENAI_IMAGE_MODEL,
-      prompt,
-      n: 1,
-      size: "1024x1024",
-      response_format: "url",
-    }),
+    body: JSON.stringify(requestBody),
   });
+
   if (!res.ok) {
     const errBody = await res.text().catch(() => "");
-    throw new Error(`OpenAI images ${res.status}: ${errBody.slice(0, 200)}`);
+    throw new Error(
+      `OpenAI images ${res.status} (model=${requestBody.model}): ${errBody.slice(0, 300)}`,
+    );
   }
+
   const data = await res.json();
-  return data?.data?.[0]?.url || null;
+  return pickImageFromResponse(data);
 }
 
-// Generate an image, push it straight to Cloudinary, and return the
-// permanent `secure_url`. Used by both the carousel pre-generation and the
-// save-to-DB endpoint so they stay in lock-step.
-//
-// Resolves to `null` (never throws) on any failure — callers should treat
-// `null` as "no image, fall back to placeholder" without aborting their flow.
+// Try the primary model. If the org isn't verified for `gpt-image-1`
+// (or the model name is otherwise rejected), automatically retry with
+// `dall-e-3` so the carousel / regen flow keeps working.
+async function generateImageWithFallback(prompt) {
+  const primary = String(OPENAI_IMAGE_MODEL || "gpt-image-1");
+  try {
+    return { ref: await generateMealImageUrl(prompt), model: primary };
+  } catch (err) {
+    const msg = String(err?.message || "");
+    const looksLikeAccess =
+      /must be verified|organization.*verify|model_not_found|model.*not.*found|invalid.*model|gpt-image-1/i.test(
+        msg,
+      );
+    if (looksLikeAccess && !/dall-e-3/i.test(primary)) {
+      console.warn(
+        `[image-gen] primary model ${primary} unavailable, falling back to dall-e-3: ${msg.slice(0, 200)}`,
+      );
+      const prevModel = process.env.OPENAI_IMAGE_MODEL;
+      process.env.OPENAI_IMAGE_MODEL = "dall-e-3";
+      try {
+        const body = buildImageRequestBody(String(prompt).slice(0, 3800));
+        const res = await fetch(OPENAI_IMAGES_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${OPENAI_API_KEY}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ ...body, model: "dall-e-3" }),
+        });
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => "");
+          throw new Error(`OpenAI images ${res.status} (dall-e-3 fallback): ${errBody.slice(0, 300)}`);
+        }
+        const data = await res.json();
+        return { ref: pickImageFromResponse(data), model: "dall-e-3" };
+      } finally {
+        process.env.OPENAI_IMAGE_MODEL = prevModel;
+      }
+    }
+    throw err;
+  }
+}
+
+// Generate + upload pipeline. Returns the permanent Cloudinary `secure_url`
+// (or `null` on any failure — the caller falls back to a placeholder).
 async function generateAndUploadMealImage(card) {
   if (!OPENAI_API_KEY) return null;
   try {
     const prompt = buildMealImagePrompt(card);
-    const remoteUrl = await generateMealImageUrl(prompt);
-    if (!remoteUrl) return null;
-    const uploaded = await uploadRemoteUrl(remoteUrl, { folder: "meals" });
+    const { ref, model } = await generateImageWithFallback(prompt);
+    if (!ref) {
+      console.error("generateAndUploadMealImage: no image in OpenAI response");
+      return null;
+    }
+    const uploaded = ref.startsWith("data:")
+      ? await uploadImage(ref, { folder: "meals" })
+      : await uploadRemoteUrl(ref, { folder: "meals" });
+    if (uploaded?.url) {
+      console.log(`[image-gen] success model=${model} -> ${uploaded.url}`);
+    }
     return uploaded?.url || null;
   } catch (e) {
     console.error("generateAndUploadMealImage", e.message || e);
@@ -1148,6 +1305,77 @@ async function mealCarouselDraftsPost(req, res) {
 }
 
 // =============================================================================
+// POST /api/kez/generate-meal-image
+// =============================================================================
+//
+// Kerry dashboard — regenerate meal hero image from structured meal data
+// (title, description, foods with weights, optional slot label). Uses the same
+// OpenAI + Cloudinary path as carousel / save-suggestion.
+//
+// Body: { title?, description?, blueprintNote?, image_prompt?, prompt?, foods?, slotLabel? }
+//       (camelCase or snake_case accepted)
+async function mealImageGeneratePost(req, res) {
+  try {
+    const b = req.body || {};
+    const title = String(b.title || b.desc || "").trim();
+    const description = String(b.description || "").trim();
+    const blueprintNote = String(b.blueprintNote || b.blueprint_note || "").trim();
+    const directPrompt = String(b.prompt || "").trim();
+    const image_prompt =
+      String(b.image_prompt || "").trim() || directPrompt;
+    const foods = Array.isArray(b.foods) ? b.foods : [];
+    const slotLabel = String(b.slotLabel || b.slot_label || "").trim();
+
+    if (!OPENAI_API_KEY) {
+      return res.status(503).json({
+        error: "OPENAI_API_KEY is not configured on the server — add it to backend env for meal image generation.",
+      });
+    }
+
+    if (
+      !title &&
+      !image_prompt &&
+      foods.length === 0 &&
+      !description &&
+      !blueprintNote
+    ) {
+      return res.status(400).json({
+        error: "Provide title, description, blueprint note, image_prompt, prompt, or foods[]",
+      });
+    }
+
+    const imageUrl = await generateAndUploadMealImage({
+      title,
+      description,
+      blueprintNote,
+      image_prompt,
+      foods,
+      slotLabel,
+    });
+
+    if (!imageUrl) {
+      return res.status(502).json({
+        error: "Image generation or Cloudinary upload failed — see server logs.",
+      });
+    }
+
+    const promptUsed = buildMealImagePrompt({
+      title,
+      description,
+      blueprintNote,
+      image_prompt,
+      foods,
+      slotLabel,
+    });
+
+    return res.json({ image_url: imageUrl, image_prompt_used: promptUsed, provider: "openai+cloudinary" });
+  } catch (e) {
+    console.error("mealImageGeneratePost", e);
+    return res.status(500).json({ error: e.message || "Image generation failed" });
+  }
+}
+
+// =============================================================================
 // POST /api/kez/save-suggestion
 // =============================================================================
 //
@@ -1199,7 +1427,9 @@ async function saveSuggestionPost(req, res) {
       imageUrl = await generateAndUploadMealImage({
         title: suggestion.title,
         description: suggestion.description,
+        blueprintNote: suggestion.blueprintNote || suggestion.blueprint_note,
         image_prompt: suggestion.image_prompt,
+        foods: suggestion.foods,
       });
     }
 
@@ -1809,4 +2039,5 @@ module.exports = {
   missionFeedbackDraftPost,
   studentFeedbackDraftPost,
   saveSuggestionPost,
+  mealImageGeneratePost,
 };

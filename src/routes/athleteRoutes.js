@@ -9,6 +9,8 @@ const {
   getMissionConfigForAthlete,
   postSubmitMissionV1,
   postSubmitMissionV2,
+  postAthleteKnowledgeChat,
+  getAthleteNutritionTargets,
 } = require("../controllers/athleteController");
 const {
   getMyTrainingPlan,
@@ -29,6 +31,7 @@ router.get("/food-prefs/catalog", getFoodPreferencesCatalog);
 router.get("/food-prefs", getFoodPreferences);
 router.post("/food-prefs", postFoodPreferences);
 router.get("/missions", getMissions);
+router.get("/nutrition-targets", getAthleteNutritionTargets);
 router.get("/mission-config", getMissionConfigForAthlete);
 router.post("/missions/:missionId/submit-v1", postSubmitMissionV1);
 router.post("/missions/:missionId/submit-v2", postSubmitMissionV2);
@@ -40,5 +43,7 @@ router.get ("/game-day-plan", getMyGameDayPlan);
 router.post("/game-day-plan", saveMyGameDayPlan);
 router.get ("/shopping-list", getMyShoppingList);
 router.post("/shopping-list", saveMyShoppingList);
+
+router.post("/knowledge-chat", postAthleteKnowledgeChat);
 
 module.exports = router;

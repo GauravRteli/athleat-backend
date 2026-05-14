@@ -9,6 +9,7 @@ const {
   missionFeedbackDraftPost,
   studentFeedbackDraftPost,
   saveSuggestionPost,
+  mealImageGeneratePost,
 } = require("../controllers/kezController");
 
 const router = express.Router();
@@ -22,5 +23,6 @@ router.post("/meal-carousel-drafts", mealCarouselDraftsPost);
 router.post("/mission-feedback-draft", missionFeedbackDraftPost);
 router.post("/student-feedback-draft", studentFeedbackDraftPost);
 router.post("/save-suggestion", saveSuggestionPost);
+router.post("/generate-meal-image", mealImageGeneratePost);
 
 module.exports = router;

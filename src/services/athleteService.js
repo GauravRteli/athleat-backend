@@ -1,4 +1,6 @@
 const { query } = require("../config/postgres");
+const { getEerConfig } = require("./eerConfigService");
+const { computeDailyEER, classifyLoadFromPrescreen } = require("./kez/targets");
 const MISSION_IDS = ["m1", "m2", "m3", "m4", "m5"];
 
 function splitName(fullName) {
@@ -26,6 +28,15 @@ async function getAthleteById(studentId) {
     [studentId],
   );
   return result.rows[0] || null;
+}
+
+/** First token for RAG / chat prompts — same fallbacks as `shapeAthlete` (trimmed DB first_name, else full_name). */
+async function resolveAthleteChatFirstName(studentId) {
+  const row = await getAthleteById(studentId);
+  if (!row) return null;
+  const fallback = splitName(row.full_name);
+  const first = String(row.first_name || "").trim() || fallback.firstName || "";
+  return first;
 }
 
 async function getAthleteMe(studentId) {
@@ -232,6 +243,58 @@ async function getFoodPrefsCatalog() {
   return Array.from(categoriesById.values()).map(({ _flagsById, ...rest }) => rest);
 }
 
+/** Same EER math as Kerry dashboard (`computeDailyEER` + global `eer_config`). */
+const PROTECT_BY_LOAD = { Lower: "5+ serves", Moderate: "5+ serves", High: "4+ serves" };
+
+async function getPlannerNutritionTargets(studentId) {
+  const prescreenRes = await query(
+    `SELECT * FROM public.prescreen
+     WHERE student_id = $1
+     ORDER BY completed_at DESC NULLS LAST, id DESC
+     LIMIT 1`,
+    [studentId],
+  );
+  const ps = prescreenRes.rows[0] || {};
+  const eerRow = await getEerConfig();
+  const eerConfig = {
+    pal: eerRow.pal || {},
+    carb_gkg: eerRow.carb_gkg || {},
+    protein_gkg: eerRow.protein_gkg,
+    fat_gday: eerRow.fat_gday,
+  };
+  const loads = ["Lower", "Moderate", "High"];
+  const byLoad = {};
+  let complete = true;
+  for (const load of loads) {
+    const daily = computeDailyEER(ps, load, eerConfig);
+    const key = load.toLowerCase();
+    if (!daily) {
+      byLoad[key] = null;
+      complete = false;
+    } else {
+      byLoad[key] = {
+        energy: `${Number(daily.eerLow).toLocaleString()}–${Number(daily.eerHigh).toLocaleString()} cal`,
+        repair: `${daily.protein.low}–${daily.protein.high} g`,
+        fuel: `${daily.carb.low}–${daily.carb.high} g`,
+        protect: PROTECT_BY_LOAD[load] || "5+ serves",
+      };
+    }
+  }
+  const inferred = classifyLoadFromPrescreen(ps);
+  const defaultDayType =
+    inferred === "High" ? "high" : inferred === "Moderate" ? "moderate" : "lower";
+  return {
+    lower: byLoad.lower,
+    moderate: byLoad.moderate,
+    high: byLoad.high,
+    complete,
+    defaultDayType,
+    message: complete
+      ? null
+      : "Complete your Pre-Screen (date of birth and weight) to see personalised targets.",
+  };
+}
+
 module.exports = {
   getAthleteMe,
   getAthleteMissions,
@@ -240,4 +303,6 @@ module.exports = {
   getFoodPrefs,
   upsertFoodPrefs,
   getFoodPrefsCatalog,
+  resolveAthleteChatFirstName,
+  getPlannerNutritionTargets,
 };

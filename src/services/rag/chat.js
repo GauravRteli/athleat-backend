@@ -41,7 +41,8 @@ function textFromAnthropicMessage(message) {
 // live in masterPrompt.js — same source as meal analysis / feedback drafts.
 // Below we add RAG-only task rules so answers stay grounded in retrieved chunks.
 
-const KNOWLEDGE_BASE_TASK_RULES = [
+/** Coach / Kerry Brain tab — no named athlete in STUDENT CONTEXT. */
+const KNOWLEDGE_BASE_TASK_RULES_COACH = [
   "Current task: KNOWLEDGE_BASE_QA — Brain tab chat with retrieval.",
   "",
   "Apply EVERY rule in the MASTER SYSTEM PROMPT above (voice for Kerry / Brain tab, hard stops, anti-doping, uncertainty flagging where relevant, etc.).",
@@ -55,6 +56,36 @@ const KNOWLEDGE_BASE_TASK_RULES = [
   "- If CONTEXT conflicts with NEVER / CORRECTION entries inside it, those override generic advice.",
   "- Keep answers concise unless the user explicitly asks for depth; Kerry Brain mode allows technical/clinical wording per the master prompt.",
 ].join("\n");
+
+/** Named athlete in STUDENT CONTEXT — overrides Brain-tab framing so the model does not address the user as Kerry. */
+function knowledgeBaseTaskRulesForAthlete(sanitizedFirstName) {
+  const fn = String(sanitizedFirstName || "").trim();
+  return [
+    "Current task: KNOWLEDGE_BASE_QA — Athlete dashboard chat (ATHLEAT program) with retrieval.",
+    "",
+    `The person you are replying to IS the athlete "${fn}" (see === STUDENT CONTEXT ===). This is not the Kerry Brain-tab coach chat.`,
+    "Never greet or address the user as Kerry, and do not imply Kerry is the one typing. Kerry O'Bryan is the human dietitian behind Virtual Kez; she is not the athlete in this thread.",
+    "",
+    `Your opening line MUST follow the master prompt using their first name: Hey ${fn}. (exact spelling; no brackets; never use [FirstName]).`,
+    "",
+    "Apply the MASTER SYSTEM PROMPT for Virtual Kez tone and guardrails, but speak directly to this athlete: clear, supportive, age-appropriate. You may use technical wording when it helps understanding.",
+    "",
+    "The === STUDENT CONTEXT === block defines [FirstName] handling. Never emit the literal characters [FirstName] in your reply.",
+    "",
+    "Retrieval grounding (non-negotiable):",
+    "- Ground factual claims in the CONTEXT block below. Prefer information that appears there.",
+    "- If CONTEXT is empty or does not support a confident answer, say plainly that the indexed knowledge base does not cover it — do not invent studies, statistics, clinical guidelines, product names, or athlete-specific data.",
+    "- When you use a fact from CONTEXT, cite it as [#1], [#2], … matching the numbered blocks.",
+    "- If CONTEXT conflicts with NEVER / CORRECTION entries inside it, those override generic advice.",
+    "- Keep answers concise unless the user explicitly asks for depth.",
+  ].join("\n");
+}
+
+function buildKnowledgeBaseTaskRules(sanitizedStudentFirstName) {
+  return sanitizedStudentFirstName
+    ? knowledgeBaseTaskRulesForAthlete(sanitizedStudentFirstName)
+    : KNOWLEDGE_BASE_TASK_RULES_COACH;
+}
 
 function trimHistory(messages, maxTurns) {
   if (!Array.isArray(messages)) return [];
@@ -139,7 +170,6 @@ function shapeSources(matches) {
 }
 
 async function chatTurn({ messages, topK, studentFirstName }) {
-  console.log(env.openai.apiKey, env.anthropic.apiKey);
   if (!env.openai.apiKey) {
     throw Object.assign(new Error("OPENAI_API_KEY not configured (required for RAG embeddings)"), { status: 503 });
   }
@@ -155,11 +185,13 @@ async function chatTurn({ messages, topK, studentFirstName }) {
 
   const stop = log.timer();
   const k = Math.max(1, Math.min(20, topK || env.rag.topK));
+  const sanitizedStudentName = sanitizeStudentFirstName(studentFirstName);
+  const kbTaskRules = buildKnowledgeBaseTaskRules(sanitizedStudentName);
   log.info("turn start", {
     q: userQ,
     history: trimmed.length,
     topK: k,
-    athlete_ctx: sanitizeStudentFirstName(studentFirstName) ? "named" : "none",
+    athlete_ctx: sanitizedStudentName ? "named" : "none",
   });
 
   const tEmbed = log.timer();
@@ -184,7 +216,7 @@ async function chatTurn({ messages, topK, studentFirstName }) {
     "",
     studentCtx,
     "",
-    KNOWLEDGE_BASE_TASK_RULES,
+    kbTaskRules,
     "",
     `=== CONTEXT (top ${matches.length} matches) ===`,
     contextBlock,

@@ -5,9 +5,12 @@ const {
   getFoodPrefs,
   upsertFoodPrefs,
   getFoodPrefsCatalog,
+  resolveAthleteChatFirstName,
+  getPlannerNutritionTargets,
 } = require("../services/athleteService");
 const { submitMissionVersion } = require("../services/studentService");
 const { getMissionConfig } = require("../services/missionConfigService");
+const { postTestChat } = require("./chatController");
 
 async function getMe(req, res, next) {
   try {
@@ -109,6 +112,30 @@ async function postSubmitMissionV2(req, res, next) {
   }
 }
 
+/** Reuses `postTestChat` — sets `studentFirstName` from the authenticated athlete (not client input). */
+async function postAthleteKnowledgeChat(req, res, next) {
+  try {
+    const me = await getAthleteMe(req.auth.studentId);
+    if (!me?.athlete) return res.status(401).json({ error: "Unauthorized." });
+    const fromDb = await resolveAthleteChatFirstName(req.auth.studentId);
+    const first = String(fromDb || "").trim() || String(me.athlete.firstName || "").trim();
+    const base = req.body && typeof req.body === "object" ? req.body : {};
+    req.body = { ...base, studentFirstName: first };
+    return postTestChat(req, res, next);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function getAthleteNutritionTargets(req, res, next) {
+  try {
+    const data = await getPlannerNutritionTargets(req.auth.studentId);
+    return res.status(200).json({ data });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   getMe,
   postUnlock,
@@ -119,4 +146,6 @@ module.exports = {
   getMissionConfigForAthlete,
   postSubmitMissionV1,
   postSubmitMissionV2,
+  postAthleteKnowledgeChat,
+  getAthleteNutritionTargets,
 };
