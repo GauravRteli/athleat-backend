@@ -20,6 +20,7 @@ const {
   getMyShoppingList,
   saveMyShoppingList,
 } = require("../controllers/planningController");
+const { postSign: postUploadSign } = require("../controllers/uploadController");
 const { requireAthleteAuth } = require("../middleware/auth");
 
 const router = express.Router();
@@ -45,5 +46,9 @@ router.get ("/shopping-list", getMyShoppingList);
 router.post("/shopping-list", saveMyShoppingList);
 
 router.post("/knowledge-chat", postAthleteKnowledgeChat);
+
+// Cloudinary signed direct upload — athletes POST the binary file straight to
+// Cloudinary, bypassing Vercel's 4.5 MB serverless body cap on submissions.
+router.post("/uploads/sign", postUploadSign);
 
 module.exports = router;

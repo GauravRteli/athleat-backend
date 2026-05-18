@@ -76,4 +76,31 @@ async function uploadRemoteUrl(remoteUrl, options = {}) {
   };
 }
 
-module.exports = { uploadImage, uploadFile, uploadRemoteUrl };
+// Sign a direct-to-Cloudinary upload so the browser can POST the binary file
+// straight to Cloudinary, bypassing Vercel's 4.5 MB serverless body limit.
+// The browser must include the returned `timestamp`, `signature`, `api_key`,
+// `folder` (and `public_id` if returned) when calling
+// `https://api.cloudinary.com/v1_1/<cloud_name>/<resource_type>/upload`.
+function signDirectUpload({ folder = "", resourceType = "image", filename } = {}) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const fullFolder = folder ? `${FOLDER}/${folder}` : FOLDER;
+  const paramsToSign = { folder: fullFolder, timestamp };
+  if (filename) {
+    paramsToSign.public_id = filename.replace(/\.[^.]+$/, "");
+  }
+  const signature = cloudinary.utils.api_sign_request(
+    paramsToSign,
+    process.env.CLOUDINARY_API_SECRET,
+  );
+  return {
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    timestamp,
+    signature,
+    folder: fullFolder,
+    resource_type: resourceType,
+    ...(paramsToSign.public_id && { public_id: paramsToSign.public_id }),
+  };
+}
+
+module.exports = { uploadImage, uploadFile, uploadRemoteUrl, signDirectUpload };

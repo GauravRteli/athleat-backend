@@ -1,4 +1,4 @@
-const { uploadImage, uploadFile } = require("../services/uploadService");
+const { uploadImage, uploadFile, signDirectUpload } = require("../services/uploadService");
 
 async function postImage(req, res, next) {
   try {
@@ -26,4 +26,21 @@ async function postFile(req, res, next) {
   }
 }
 
-module.exports = { postImage, postFile };
+// Returns a short-lived Cloudinary upload signature so the browser can POST
+// the binary file directly to Cloudinary, bypassing Vercel's 4.5 MB request
+// body limit (which trips `FUNCTION_PAYLOAD_TOO_LARGE` on large uploads).
+async function postSign(req, res, next) {
+  try {
+    const { folder, resource_type, filename } = req.body || {};
+    const result = signDirectUpload({
+      folder,
+      resourceType: resource_type,
+      filename,
+    });
+    return res.status(200).json(result);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+module.exports = { postImage, postFile, postSign };
