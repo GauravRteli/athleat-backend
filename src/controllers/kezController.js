@@ -1435,6 +1435,8 @@ async function saveSuggestionPost(req, res) {
 
     // Step 3: meal create. `foods[]` may carry an explicit `item_id` (preferred
     // path — fast bulk insert) or only a name (slow path inside mealsService).
+    // Pass `selected_qty_unit` through verbatim so Kerry's recipe portions
+    // (e.g. "40g or 1/2 cup") survive a Save-card → Edit-meal round trip.
     const foodsPayload = (suggestion.foods || []).map((f) => ({
       item_id: f.item_id || f.food_id || null,
       food_name: f.food_name || f.title || "Ingredient",
@@ -1445,6 +1447,7 @@ async function saveSuggestionPost(req, res) {
       fat_g: Number(f.fat_g) || 0,
       energy_kj: Number(f.energy_kj) || 0,
       unit: f.unit || "g",
+      selected_qty_unit: f.selected_qty_unit || null,
     }));
 
     const created = await mealsService.createMeal({
