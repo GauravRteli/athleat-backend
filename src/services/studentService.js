@@ -450,6 +450,29 @@ async function submitMissionVersion(studentId, missionId, versionKey, versionDat
   return { complete: isComplete, status: isComplete ? "submitted" : "in_progress" };
 }
 
+async function updateMissionSlotDesc(studentId, missionId, version, slotId, desc) {
+  if (!isValidMissionId(missionId)) throw new Error("Invalid mission id");
+  if (!["v1", "v2"].includes(version)) throw new Error("Invalid mission version");
+  if (!slotId || typeof slotId !== "string") throw new Error("Invalid slot id");
+  const cleanDesc = typeof desc === "string" ? desc : "";
+
+  const result = await query(
+    `UPDATE public.missions
+       SET ${version} = jsonb_set(
+         COALESCE(${version}, '{}'::jsonb),
+         ARRAY[$3::text, 'desc'],
+         to_jsonb($4::text),
+         true
+       )
+     WHERE student_id = $1 AND mission_id = $2
+     RETURNING ${version}`,
+    [studentId, missionId, slotId, cleanDesc],
+  );
+
+  if (!result.rows?.[0]) throw new Error("Mission row not found");
+  return result.rows[0][version] || null;
+}
+
 module.exports = {
   listStudentsForDashboard,
   updateStudentFeedback,
@@ -460,4 +483,5 @@ module.exports = {
   getStudentMissions,
   saveMissionProgress,
   submitMissionVersion,
+  updateMissionSlotDesc,
 };

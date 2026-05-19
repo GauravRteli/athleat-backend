@@ -8,6 +8,7 @@ const {
   getStudentMissions,
   saveMissionProgress,
   submitMissionVersion,
+  updateMissionSlotDesc,
 } = require("../services/studentService");
 
 async function getStudents(req, res, next) {
@@ -112,6 +113,17 @@ async function postSubmitMissionV2(req, res, next) {
   }
 }
 
+async function patchMissionSlotDesc(req, res, next) {
+  try {
+    const { studentId, missionId } = req.params;
+    const { version, slot_id: slotId, desc } = req.body || {};
+    const updated = await updateMissionSlotDesc(studentId, missionId, version, slotId, desc);
+    return res.status(200).json({ ok: true, [version]: updated });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   getStudents,
   patchStudentFeedback,
@@ -123,4 +135,5 @@ module.exports = {
   putMissionProgress,
   postSubmitMissionV1,
   postSubmitMissionV2,
+  patchMissionSlotDesc,
 };

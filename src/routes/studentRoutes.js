@@ -10,6 +10,7 @@ const {
   putMissionProgress,
   postSubmitMissionV1,
   postSubmitMissionV2,
+  patchMissionSlotDesc,
 } = require("../controllers/studentController");
 
 const router = express.Router();
@@ -17,6 +18,7 @@ const router = express.Router();
 router.get("/", getStudents);
 router.patch("/:studentId/feedback", patchStudentFeedback);
 router.patch("/:studentId/missions/:missionId/feedback", patchMissionFeedback);
+router.patch("/:studentId/missions/:missionId/slot-desc", patchMissionSlotDesc);
 router.patch("/questions/:questionId/reply", patchQuestionReply);
 router.get("/:studentId/prescreen", getPrescreenByStudent);
 router.put("/:studentId/prescreen", putPrescreenByStudent);
