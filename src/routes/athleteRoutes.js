@@ -11,6 +11,8 @@ const {
   postSubmitMissionV2,
   postAthleteKnowledgeChat,
   getAthleteNutritionTargets,
+  getAthletePrescreen,
+  postAthletePrescreen,
 } = require("../controllers/athleteController");
 const {
   getMyTrainingPlan,
@@ -28,6 +30,8 @@ const router = express.Router();
 router.use(requireAthleteAuth);
 router.get("/me", getMe);
 router.post("/unlock", postUnlock);
+router.get("/pre-screen", getAthletePrescreen);
+router.post("/pre-screen", postAthletePrescreen);
 router.get("/food-prefs/catalog", getFoodPreferencesCatalog);
 router.get("/food-prefs", getFoodPreferences);
 router.post("/food-prefs", postFoodPreferences);

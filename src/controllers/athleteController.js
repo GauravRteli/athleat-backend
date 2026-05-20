@@ -7,8 +7,13 @@ const {
   getFoodPrefsCatalog,
   resolveAthleteChatFirstName,
   getPlannerNutritionTargets,
+  applyUnlockProgression,
 } = require("../services/athleteService");
-const { submitMissionVersion } = require("../services/studentService");
+const {
+  submitMissionVersion,
+  getStudentPrescreen,
+  upsertStudentPrescreen,
+} = require("../services/studentService");
 const { getMissionConfig } = require("../services/missionConfigService");
 const { postTestChat } = require("./chatController");
 
@@ -136,6 +141,28 @@ async function getAthleteNutritionTargets(req, res, next) {
   }
 }
 
+async function getAthletePrescreen(req, res, next) {
+  try {
+    const data = await getStudentPrescreen(req.auth.studentId);
+    return res.status(200).json({ data });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function postAthletePrescreen(req, res, next) {
+  try {
+    await upsertStudentPrescreen(req.auth.studentId, req.body || {});
+    const newlyUnlocked = await applyUnlockProgression(
+      req.auth.studentId,
+      "prescreen_submitted",
+    );
+    return res.status(200).json({ ok: true, newlyUnlocked });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   getMe,
   postUnlock,
@@ -148,4 +175,6 @@ module.exports = {
   postSubmitMissionV2,
   postAthleteKnowledgeChat,
   getAthleteNutritionTargets,
+  getAthletePrescreen,
+  postAthletePrescreen,
 };
