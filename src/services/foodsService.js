@@ -8,6 +8,7 @@
 // =============================================================================
 
 const { query } = require("../config/postgres");
+const { resolveStorageUrl } = require("../utils/storageUrl");
 
 const num = (v) => {
   if (v === null || v === undefined || v === "") return null;
@@ -30,7 +31,8 @@ function shapeItem(row) {
     title: row.title,
     description: row.description,
     note: row.note,
-    image: row.image,
+    image: resolveStorageUrl(row.image),
+    image_url: resolveStorageUrl(row.image),
     serving_label: row.serving_size_unit
       ? `${row.serving_size || ""} ${row.serving_size_unit}`.trim()
       : row.serving_size || null,

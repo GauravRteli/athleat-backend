@@ -9,6 +9,9 @@ const {
   saveMissionProgress,
   submitMissionVersion,
   updateMissionSlotDesc,
+  updateMissionSlotTitle,
+  getEerOverrides,
+  saveEerOverrides,
 } = require("../services/studentService");
 
 async function getStudents(req, res, next) {
@@ -124,6 +127,45 @@ async function patchMissionSlotDesc(req, res, next) {
   }
 }
 
+// PATCH /api/students/:studentId/missions/:missionId/slot-title
+// Body: { version: "v1"|"v2"|"v3", slot_id: string, title: string }
+async function patchMissionSlotTitle(req, res, next) {
+  try {
+    const { studentId, missionId } = req.params;
+    const { version, slot_id: slotId, title } = req.body || {};
+    const updated = await updateMissionSlotTitle(studentId, missionId, version, slotId, title);
+    return res.status(200).json({ ok: true, [version]: updated });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+// GET  /api/students/:studentId/eer-overrides              → { data: [...rows] }
+// PATCH /api/students/:studentId/eer-overrides             body: { loadDay, overrides }
+async function getStudentEerOverrides(req, res, next) {
+  try {
+    const { studentId } = req.params;
+    const rows = await getEerOverrides(studentId);
+    return res.status(200).json({ data: rows });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function patchStudentEerOverrides(req, res, next) {
+  try {
+    const { studentId } = req.params;
+    const { loadDay, overrides } = req.body || {};
+    if (!loadDay) {
+      return res.status(400).json({ error: "loadDay is required" });
+    }
+    const row = await saveEerOverrides(studentId, loadDay, overrides);
+    return res.status(200).json({ data: row });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   getStudents,
   patchStudentFeedback,
@@ -136,4 +178,7 @@ module.exports = {
   postSubmitMissionV1,
   postSubmitMissionV2,
   patchMissionSlotDesc,
+  patchMissionSlotTitle,
+  getStudentEerOverrides,
+  patchStudentEerOverrides,
 };

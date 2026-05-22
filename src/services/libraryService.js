@@ -6,6 +6,7 @@
 // =============================================================================
 
 const { query, pool } = require("../config/postgres");
+const { resolveStorageUrl } = require("../utils/storageUrl");
 
 // ───────────────────────────── categories ─────────────────────────────
 
@@ -287,7 +288,8 @@ async function listFlagCatalog() {
       flag.items.push({
         id: row.item_id,
         title: row.item_title,
-        image: row.item_image || null,
+        image: resolveStorageUrl(row.item_image) || null,
+        image_url: resolveStorageUrl(row.item_image) || null,
       });
     }
   }

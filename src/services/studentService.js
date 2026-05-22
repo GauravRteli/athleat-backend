@@ -473,6 +473,78 @@ async function updateMissionSlotDesc(studentId, missionId, version, slotId, desc
   return result.rows[0][version] || null;
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// v5.2 — KerryDashboard additions
+// ────────────────────────────────────────────────────────────────────────────
+
+// PATCH a single slot title inside missions.v1 / v2 / v3 jsonb.
+// Used by the v5.2 SlotCol title input (debounced 800 ms on the client).
+async function updateMissionSlotTitle(studentId, missionId, version, slotId, title) {
+  if (!isValidMissionId(missionId)) throw new Error("Invalid mission id");
+  if (!["v1", "v2", "v3"].includes(version)) throw new Error("Invalid mission version");
+  if (!slotId || typeof slotId !== "string") throw new Error("Invalid slot id");
+  const cleanTitle = typeof title === "string" ? title : "";
+
+  const result = await query(
+    `UPDATE public.missions
+       SET ${version} = jsonb_set(
+         COALESCE(${version}, '{}'::jsonb),
+         ARRAY[$3::text, 'title'],
+         to_jsonb($4::text),
+         true
+       )
+     WHERE student_id = $1 AND mission_id = $2
+     RETURNING ${version}`,
+    [studentId, missionId, slotId, cleanTitle],
+  );
+
+  if (!result.rows?.[0]) throw new Error("Mission row not found");
+  return result.rows[0][version] || null;
+}
+
+// Get / Upsert athlete_eer_overrides — one row per (athlete_id, load_day).
+// Schema (Phase 1.1 of the v5.2 task sheet):
+//   id uuid pk, athlete_id (FK -> students.id), load_day text,
+//   overrides jsonb, updated_at timestamptz default now().
+async function getEerOverrides(studentId) {
+  const result = await query(
+    `SELECT athlete_id, load_day, overrides, updated_at
+       FROM public.athlete_eer_overrides
+      WHERE athlete_id = $1`,
+    [studentId],
+  );
+  return result.rows.map((r) => ({
+    athleteId: r.athlete_id,
+    loadDay: r.load_day,
+    overrides: r.overrides || {},
+    updatedAt: r.updated_at,
+  }));
+}
+
+async function saveEerOverrides(studentId, loadDay, overrides) {
+  if (!["Lower", "Moderate", "High"].includes(loadDay)) {
+    throw new Error("loadDay must be Lower | Moderate | High");
+  }
+  const payload = overrides && typeof overrides === "object" ? overrides : {};
+
+  const result = await query(
+    `INSERT INTO public.athlete_eer_overrides (athlete_id, load_day, overrides, updated_at)
+     VALUES ($1, $2, $3::jsonb, now())
+     ON CONFLICT (athlete_id, load_day)
+       DO UPDATE SET overrides = EXCLUDED.overrides, updated_at = now()
+     RETURNING athlete_id, load_day, overrides, updated_at`,
+    [studentId, loadDay, JSON.stringify(payload)],
+  );
+
+  const r = result.rows[0];
+  return {
+    athleteId: r.athlete_id,
+    loadDay: r.load_day,
+    overrides: r.overrides || {},
+    updatedAt: r.updated_at,
+  };
+}
+
 module.exports = {
   listStudentsForDashboard,
   updateStudentFeedback,
@@ -484,4 +556,7 @@ module.exports = {
   saveMissionProgress,
   submitMissionVersion,
   updateMissionSlotDesc,
+  updateMissionSlotTitle,
+  getEerOverrides,
+  saveEerOverrides,
 };

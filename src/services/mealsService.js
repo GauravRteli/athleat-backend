@@ -13,6 +13,7 @@
 
 const { pool, query } = require("../config/postgres");
 const { embedMealAndStore } = require("./mealEmbeddings");
+const { resolveStorageUrl } = require("../utils/storageUrl");
 
 const num = (v) => {
   if (v === null || v === undefined || v === "") return null;
@@ -55,7 +56,8 @@ function shapeFood(row) {
     fat_g: num(row.fat),
     selected_qty_unit: row.selected_qty_unit,
     sort_order: row.order,
-    image: row.item_image,
+    image: resolveStorageUrl(row.item_image),
+    image_url: resolveStorageUrl(row.item_image),
   };
 }
 
@@ -78,8 +80,8 @@ function shapeMeal(row, foods = [], categories = [], subCategories = [], tags = 
     blueprint_note: row.note,        // legacy meals.note doubles as Kerry's blueprint note
     note: row.note,
     instructions: null,              // not stored in legacy schema
-    image_url: row.image,
-    image: row.image,
+    image_url: resolveStorageUrl(row.image),
+    image: resolveStorageUrl(row.image),
     image_prompt: null,              // not stored in legacy schema
     user_id: row.user_id,
     source: row.user_id ? "user" : "kerry",

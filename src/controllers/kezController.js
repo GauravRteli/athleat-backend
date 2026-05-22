@@ -1,4 +1,5 @@
 const { query } = require("../config/postgres");
+const { resolveStorageUrl } = require("../utils/storageUrl");
 const { runMealVision } = require("../services/kez/vision");
 const { resolveLabelToFood, overallConfidence } = require("../services/kez/foodResolver");
 const { scaleFoodRow, sumMacros, finalizeTotals } = require("../services/kez/macros");
@@ -767,6 +768,11 @@ function legacyMealToCarouselCard(meal) {
     item_id: f.item_id,
     food_id: f.item_id,
     food_name: f.food_name,
+    qty: f.qty != null ? String(f.qty) : (f.item_qty != null ? String(f.item_qty) : ""),
+    unit: f.unit || f.item_qty_unit || "g",
+    item_qty: f.item_qty,
+    item_qty_unit: f.item_qty_unit,
+    selected_qty_unit: f.selected_qty_unit,
     weight_grams: Number(f.weight_g) || 0,
     weight_g: Number(f.weight_g) || 0,
     energy_kj: Number(f.energy_kj) || 0,
@@ -787,7 +793,7 @@ function legacyMealToCarouselCard(meal) {
     title: meal.title,
     description: meal.description || "",
     blueprintNote: meal.blueprint_note || "",
-    image_url: meal.image_url || "",
+    image_url: resolveStorageUrl(meal.image_url || meal.image || ""),
     image_prompt: "",
     source: "database",
     unverified_foods: [],
@@ -834,7 +840,7 @@ async function loadLegacyMealsByIds(orderedIds) {
     ),
     query(
       `SELECT im.meal_id, im.id, im.item_id,
-              im.item_qty, im.item_qty_unit,
+              im.item_qty, im.item_qty_unit, im.selected_qty_unit,
               im.energy, im.protein, im.carbs, im.fat,
               i.title AS item_title
          FROM public.item_meals im
@@ -871,7 +877,13 @@ async function loadLegacyMealsByIds(orderedIds) {
       item_id: r.item_id,
       food_id: r.item_id,
       food_name: r.item_title || `Item #${r.item_id}`,
+      qty: r.item_qty != null ? String(r.item_qty) : "",
+      unit: r.item_qty_unit || "g",
+      item_qty: r.item_qty,
+      item_qty_unit: r.item_qty_unit,
+      selected_qty_unit: r.selected_qty_unit,
       weight_g: Number(r.item_qty) || null,
+      weight_grams: Number(r.item_qty) || null,
       energy_kj: energyKj,
       protein_g: Number(r.protein) || 0,
       carb_g: Number(r.carbs) || 0,
@@ -907,7 +919,7 @@ async function loadLegacyMealsByIds(orderedIds) {
       title: r.title,
       description: r.description || "",
       blueprint_note: r.note || "",
-      image_url: r.image || "",
+      image_url: resolveStorageUrl(r.image || ""),
       categories: catsByMeal.get(mealKey) || [],
       meal_foods,
       energy_kj: totals.energy_kj,
@@ -2032,6 +2044,125 @@ async function studentFeedbackDraftPost(req, res) {
   }
 }
 
+// =============================================================================
+// POST /api/kez/estimate-macros
+// =============================================================================
+//
+// v5.2 helper: take a free-text food/meal description (and optional
+// foods[] / serving info) and return a rough per-serving macro estimate
+// using the same Claude / OpenAI fallback chain the rest of Kez uses.
+//
+// Body:
+//   {
+//     kind?: "food" | "meal",          // mainly for prompt phrasing
+//     name?, description?, notes?,
+//     serving_label?,                  // e.g. "1 cup", "100 g"
+//     foods?: [{ food_name, weight_g?, qty?, unit? }],
+//   }
+//
+// Returns: { data: { energy_kcal, energy_kj, protein_g, carb_g, fat_g } }
+// All numeric fields are best-effort integers; never throws if the LLM
+// reply isn't perfectly shaped (missing fields come back as null).
+async function estimateMacrosPost(req, res) {
+  try {
+    const b = req.body || {};
+    const kind = String(b.kind || "meal").toLowerCase() === "food" ? "food" : "meal";
+
+    const name = String(b.name || b.title || "").trim();
+    const description = String(b.description || "").trim();
+    const notes = String(b.notes || "").trim();
+    const servingLabel = String(b.serving_label || b.serving || "").trim();
+
+    const foodsLines = (Array.isArray(b.foods) ? b.foods : [])
+      .map((f) => {
+        if (!f || typeof f !== "object") return "";
+        const nm = String(f.food_name || f.name || f.title || "").trim();
+        if (!nm) return "";
+        const w = f.weight_g ?? f.weight_grams ?? f.grams_estimate;
+        const qty = f.qty ?? f.quantity;
+        const unit = f.unit;
+        if (Number.isFinite(Number(w))) return `${nm} (~${Math.round(Number(w))} g)`;
+        if (qty && unit) return `${nm} (${qty} ${unit})`;
+        return nm;
+      })
+      .filter(Boolean);
+
+    if (!name && !description && foodsLines.length === 0) {
+      return res
+        .status(400)
+        .json({ error: "Provide at least a name, description, or foods[]." });
+    }
+
+    const system = [
+      "You are a sports nutrition assistant.",
+      "Given a description of a single",
+      kind === "food" ? "food item" : "meal",
+      "(plus optional list of ingredients/weights and a serving label),",
+      "estimate its macronutrients PER SERVING.",
+      "",
+      "Output STRICT JSON only — no markdown, no preamble — with this exact shape:",
+      "{",
+      '  "energy_kcal": number | null,',
+      '  "energy_kj":   number | null,',
+      '  "protein_g":   number | null,',
+      '  "carb_g":      number | null,',
+      '  "fat_g":       number | null,',
+      '  "notes":       string | null',
+      "}",
+      "",
+      "If you can't make a reasonable estimate (e.g. the description is empty),",
+      "return all numeric fields as null and put the reason in `notes`.",
+      "Round numbers to whole integers. If only kcal is known set kj ≈ kcal * 4.184.",
+    ].join(" ");
+
+    const userText = [
+      `Kind: ${kind}`,
+      name ? `Name: ${name}` : "",
+      description ? `Description: ${description}` : "",
+      servingLabel ? `Serving: ${servingLabel}` : "",
+      notes ? `Notes: ${notes}` : "",
+      foodsLines.length ? `Ingredients: ${foodsLines.join("; ")}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const raw = await callLlmText(userText, { system, json: true });
+    const jsonStr = extractJsonObject(raw) || raw || "{}";
+
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonStr);
+    } catch {
+      parsed = {};
+    }
+
+    const num = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.round(n) : null;
+    };
+
+    const energy_kcal = num(parsed.energy_kcal);
+    let energy_kj = num(parsed.energy_kj);
+    if (energy_kj == null && energy_kcal != null) {
+      energy_kj = Math.round(energy_kcal * 4.184);
+    }
+
+    return res.json({
+      data: {
+        energy_kcal,
+        energy_kj,
+        protein_g: num(parsed.protein_g),
+        carb_g: num(parsed.carb_g),
+        fat_g: num(parsed.fat_g),
+        notes: typeof parsed.notes === "string" ? parsed.notes : null,
+      },
+    });
+  } catch (e) {
+    console.error("estimateMacrosPost", e);
+    return res.status(500).json({ error: e.message || "Estimate failed" });
+  }
+}
+
 module.exports = {
   mealAnalysisGet,
   mealAnalysisPost,
@@ -2043,4 +2174,5 @@ module.exports = {
   studentFeedbackDraftPost,
   saveSuggestionPost,
   mealImageGeneratePost,
+  estimateMacrosPost,
 };
