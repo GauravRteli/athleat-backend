@@ -2,6 +2,10 @@
  * Cascading unlock filter — strips orphan `student_unlocks` rows that skip the
  * linear chain (prescreen → food-prefs → m1 → m2 → … → tools).
  */
+const {
+  DEV_UNLOCK_ALL_MISSIONS,
+  allAthleteModuleKeys,
+} = require("../config/devFlags");
 const MISSION_IDS = ["m1", "m2", "m3", "m4", "m5"];
 
 const TOOL_DEPS = {
@@ -23,6 +27,9 @@ function missionModuleKeys(index) {
  */
 function filterUnlocksForProgression(rawUnlocks, missionsById = {}, gates = {}) {
   const raw = Array.isArray(rawUnlocks) ? rawUnlocks : [];
+  if (DEV_UNLOCK_ALL_MISSIONS) {
+    return [...new Set([...allAthleteModuleKeys(), ...raw])];
+  }
   const out = new Set(["pre-screen"]);
 
   const prescreenOk =
@@ -65,6 +72,7 @@ function filterUnlocksForProgression(rawUnlocks, missionsById = {}, gates = {}) 
 
 /** Whether a Thinkific/manual unlock POST is allowed right now. */
 function isModuleUnlockAllowed(moduleKey, rawUnlocks, missionsById = {}, gates = {}) {
+  if (DEV_UNLOCK_ALL_MISSIONS) return true;
   const filtered = new Set(
     filterUnlocksForProgression(rawUnlocks, missionsById, gates),
   );
@@ -81,6 +89,7 @@ function isModuleUnlockAllowed(moduleKey, rawUnlocks, missionsById = {}, gates =
 
 /** Mission index 0..4 (m1..m5) reachable in the athlete nav. */
 function isMissionGroupAccessible(missionIndex, missionsById, effectiveUnlocks, def) {
+  if (DEV_UNLOCK_ALL_MISSIONS) return true;
   if (!effectiveUnlocks.includes("food-preferences")) return false;
 
   for (let j = 0; j < missionIndex; j++) {

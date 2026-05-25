@@ -1,6 +1,7 @@
 const { query } = require("../config/postgres");
 const { getEerConfig } = require("./eerConfigService");
 const { computeDailyEER, classifyLoadFromPrescreen } = require("./kez/targets");
+const { DEV_UNLOCK_ALL_MISSIONS } = require("../config/devFlags");
 const {
   filterUnlocksForProgression,
   isModuleUnlockAllowed,
@@ -212,12 +213,12 @@ async function getAthleteMissions(studentId) {
 
   MISSION_IDS.forEach((missionId, idx) => {
     const keys = missionModuleKeys(idx);
-    missions[missionId].unlocked = isMissionGroupAccessible(
-      idx,
-      missions,
-      effectiveUnlocks,
-      { v1Key: keys.v1, v23Key: keys.v23 },
-    );
+    missions[missionId].unlocked =
+      DEV_UNLOCK_ALL_MISSIONS ||
+      isMissionGroupAccessible(idx, missions, effectiveUnlocks, {
+        v1Key: keys.v1,
+        v23Key: keys.v23,
+      });
   });
 
   return missions;

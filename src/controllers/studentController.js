@@ -9,6 +9,7 @@ const {
   saveMissionProgress,
   submitMissionVersion,
   updateMissionSlotDesc,
+  updateMissionSlotLoadDay,
   updateMissionSlotTitle,
   getEerOverrides,
   saveEerOverrides,
@@ -143,6 +144,26 @@ async function patchMissionSlotDesc(req, res, next) {
   }
 }
 
+// PATCH /api/students/:studentId/missions/:missionId/slot-load-day
+// Body: { version: "v1"|"v2", slot_id: string, load_day: string }
+async function patchMissionSlotLoadDay(req, res, next) {
+  try {
+    const { studentId, missionId } = req.params;
+    const { version, slot_id: slotId, load_day: loadDay, loadDay: loadDayCamel } =
+      req.body || {};
+    const updated = await updateMissionSlotLoadDay(
+      studentId,
+      missionId,
+      version,
+      slotId,
+      loadDay ?? loadDayCamel,
+    );
+    return res.status(200).json({ ok: true, [version]: updated });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 // PATCH /api/students/:studentId/missions/:missionId/slot-title
 // Body: { version: "v1"|"v2"|"v3", slot_id: string, title: string }
 async function patchMissionSlotTitle(req, res, next) {
@@ -194,6 +215,7 @@ module.exports = {
   postSubmitMissionV1,
   postSubmitMissionV2,
   patchMissionSlotDesc,
+  patchMissionSlotLoadDay,
   patchMissionSlotTitle,
   getStudentEerOverrides,
   patchStudentEerOverrides,

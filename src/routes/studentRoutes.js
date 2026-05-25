@@ -11,6 +11,7 @@ const {
   postSubmitMissionV1,
   postSubmitMissionV2,
   patchMissionSlotDesc,
+  patchMissionSlotLoadDay,
   patchMissionSlotTitle,
   getStudentEerOverrides,
   patchStudentEerOverrides,
@@ -22,6 +23,7 @@ router.get("/", getStudents);
 router.patch("/:studentId/feedback", patchStudentFeedback);
 router.patch("/:studentId/missions/:missionId/feedback", patchMissionFeedback);
 router.patch("/:studentId/missions/:missionId/slot-desc", patchMissionSlotDesc);
+router.patch("/:studentId/missions/:missionId/slot-load-day", patchMissionSlotLoadDay);
 router.patch("/:studentId/missions/:missionId/slot-title", patchMissionSlotTitle);
 router.patch("/questions/:questionId/reply", patchQuestionReply);
 router.get("/:studentId/prescreen", getPrescreenByStudent);

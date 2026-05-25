@@ -1,4 +1,5 @@
 const { query } = require("../config/postgres");
+const { DEV_UNLOCK_ALL_MISSIONS } = require("../config/devFlags");
 const { toYyyyMmDd } = require("../utils/dateInput");
 const { applyUnlockProgression } = require("./athleteService");
 const MISSION_IDS = ["m1", "m2", "m3", "m4", "m5"];
@@ -11,6 +12,7 @@ function isValidMissionId(missionId) {
 // look at prescreen / food-prefs). The strict submit-time gate is in
 // `assertSubmissionAllowed` below.
 function isMissionUnlocked(missionsById, missionId) {
+  if (DEV_UNLOCK_ALL_MISSIONS) return true;
   if (missionId === "m1") return true;
   const idx = MISSION_IDS.indexOf(missionId);
   if (idx <= 0) return false;
@@ -30,6 +32,7 @@ function isMissionUnlocked(missionsById, missionId) {
 //   - V2 of any mission requires that mission's V1 submission
 //     (`missions.submitted_at`).
 async function assertSubmissionAllowed(studentId, missionId, versionKey) {
+  if (DEV_UNLOCK_ALL_MISSIONS) return { ok: true };
   if (!isValidMissionId(missionId)) {
     return { ok: false, reason: "Invalid mission id." };
   }
@@ -469,7 +472,7 @@ async function getStudentMissions(studentId) {
 async function saveMissionProgress(studentId, missionId, payload = {}) {
   if (!isValidMissionId(missionId)) throw new Error("Invalid mission id");
   const missions = await getStudentMissions(studentId);
-  if (!missions[missionId]?.unlocked) {
+  if (!DEV_UNLOCK_ALL_MISSIONS && !missions[missionId]?.unlocked) {
     const err = new Error("Mission is locked");
     err.code = "MISSION_LOCKED";
     err.statusCode = 409;
@@ -565,6 +568,52 @@ async function updateMissionSlotDesc(studentId, missionId, version, slotId, desc
   return result.rows[0][version] || null;
 }
 
+const SLOT_LOAD_DAY_VALUES = new Set(["rest", "lower", "moderate", "high"]);
+
+function normalizeSlotLoadDay(loadDay) {
+  if (loadDay == null || loadDay === "") return "";
+  const s = String(loadDay).trim();
+  const map = {
+    "Rest Day": "rest",
+    "Low Load": "lower",
+    Moderate: "moderate",
+    "High Load": "high",
+    rest: "rest",
+    lower: "lower",
+    moderate: "moderate",
+    high: "high",
+  };
+  const key = map[s] || map[s.toLowerCase()];
+  if (!key || !SLOT_LOAD_DAY_VALUES.has(key)) {
+    throw new Error("Invalid load day");
+  }
+  return key;
+}
+
+/** PATCH `loadDay` on a single slot inside missions.v1 / v2 (athlete upload load). */
+async function updateMissionSlotLoadDay(studentId, missionId, version, slotId, loadDay) {
+  if (!isValidMissionId(missionId)) throw new Error("Invalid mission id");
+  if (!["v1", "v2"].includes(version)) throw new Error("Invalid mission version");
+  if (!slotId || typeof slotId !== "string") throw new Error("Invalid slot id");
+  const cleanLoad = normalizeSlotLoadDay(loadDay);
+
+  const result = await query(
+    `UPDATE public.missions
+       SET ${version} = jsonb_set(
+         COALESCE(${version}, '{}'::jsonb),
+         ARRAY[$3::text, 'loadDay'],
+         to_jsonb($4::text),
+         true
+       )
+     WHERE student_id = $1 AND mission_id = $2
+     RETURNING ${version}`,
+    [studentId, missionId, slotId, cleanLoad],
+  );
+
+  if (!result.rows?.[0]) throw new Error("Mission row not found");
+  return result.rows[0][version] || null;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // v5.2 — KerryDashboard additions
 // ────────────────────────────────────────────────────────────────────────────
@@ -649,6 +698,7 @@ module.exports = {
   submitMissionVersion,
   assertSubmissionAllowed,
   updateMissionSlotDesc,
+  updateMissionSlotLoadDay,
   updateMissionSlotTitle,
   getEerOverrides,
   saveEerOverrides,
