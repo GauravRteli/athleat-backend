@@ -8,6 +8,17 @@ function isValidMissionId(missionId) {
   return MISSION_IDS.includes(missionId);
 }
 
+/** Kerry slot/feedback PATCHes need a missions row; athlete progress may not have created one yet. */
+async function ensureMissionRow(studentId, missionId) {
+  if (!isValidMissionId(missionId)) throw new Error("Invalid mission id");
+  await query(
+    `INSERT INTO public.missions (student_id, mission_id, status)
+     VALUES ($1, $2, 'not_started')
+     ON CONFLICT (student_id, mission_id) DO NOTHING`,
+    [studentId, missionId],
+  );
+}
+
 // Linear mission unlock used for the Kerry dashboard read-only view (does NOT
 // look at prescreen / food-prefs). The strict submit-time gate is in
 // `assertSubmissionAllowed` below.
@@ -286,12 +297,15 @@ async function updateStudentFeedback(studentId, kerryFeedback, feedbackStatus) {
 }
 
 async function updateMissionFeedback(studentId, missionId, kerryFeedback, feedbackStatus, v3) {
+  await ensureMissionRow(studentId, missionId);
   const feedbackApprovedAt = feedbackStatus === "approved" ? new Date().toISOString() : null;
+  const v3Json =
+    v3 != null && typeof v3 === "object" ? JSON.stringify(v3) : null;
   await query(
     `UPDATE public.missions
      SET kerry_feedback = $1, feedback_status = $2, feedback_approved_at = $3, v3 = $4
      WHERE student_id = $5 AND mission_id = $6`,
-    [kerryFeedback, feedbackStatus, feedbackApprovedAt, JSON.stringify(v3), studentId, missionId],
+    [kerryFeedback, feedbackStatus, feedbackApprovedAt, v3Json, studentId, missionId],
   );
 }
 
@@ -550,6 +564,7 @@ async function updateMissionSlotDesc(studentId, missionId, version, slotId, desc
   if (!["v1", "v2"].includes(version)) throw new Error("Invalid mission version");
   if (!slotId || typeof slotId !== "string") throw new Error("Invalid slot id");
   const cleanDesc = typeof desc === "string" ? desc : "";
+  await ensureMissionRow(studentId, missionId);
 
   const result = await query(
     `UPDATE public.missions
@@ -596,6 +611,7 @@ async function updateMissionSlotLoadDay(studentId, missionId, version, slotId, l
   if (!["v1", "v2"].includes(version)) throw new Error("Invalid mission version");
   if (!slotId || typeof slotId !== "string") throw new Error("Invalid slot id");
   const cleanLoad = normalizeSlotLoadDay(loadDay);
+  await ensureMissionRow(studentId, missionId);
 
   const result = await query(
     `UPDATE public.missions
@@ -625,6 +641,7 @@ async function updateMissionSlotTitle(studentId, missionId, version, slotId, tit
   if (!["v1", "v2", "v3"].includes(version)) throw new Error("Invalid mission version");
   if (!slotId || typeof slotId !== "string") throw new Error("Invalid slot id");
   const cleanTitle = typeof title === "string" ? title : "";
+  await ensureMissionRow(studentId, missionId);
 
   const result = await query(
     `UPDATE public.missions

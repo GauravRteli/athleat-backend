@@ -360,25 +360,25 @@ async function matchIngredient(name) {
 
   console.log(`\n[ingredientMatcher] 🔍 matching "${clean}"`);
 
-  // Tier 1 — verified items
+  // Tier 1 — verified items (food_items table)
   let row = await lookupItem(clean, { verified: true });
   if (row) {
     console.log(`  ✅ TIER 1 hit (items_verified) → id=${row.id} title="${row.title}"`);
     return {
       source: "items_verified",
-      source_label: "Woolworths (verified)",
+      source_label: "Verified DB",
       matched: itemRowToPer100g(row),
     };
   }
   console.log("  ✗ tier 1 (items verified)  — no match");
 
-  // Tier 2 — unverified items
+  // Tier 2 — unverified items (food_items table, not yet locked)
   row = await lookupItem(clean, { verified: false });
   if (row) {
     console.log(`  ✅ TIER 2 hit (items_unverified) → id=${row.id} title="${row.title}"`);
     return {
       source: "items_unverified",
-      source_label: "Library (unverified)",
+      source_label: "Verified DB",
       matched: itemRowToPer100g(row),
     };
   }
@@ -390,7 +390,7 @@ async function matchIngredient(name) {
     console.log(`  ✅ TIER 3 hit (generic_afcd) → id=${row.id} food_name="${row.food_name}"`);
     return {
       source: "generic_afcd",
-      source_label: "AFCD",
+      source_label: "Unverified DB",
       matched: genericRowToPer100g(row),
     };
   }
@@ -402,7 +402,7 @@ async function matchIngredient(name) {
     console.log(`  ✅ TIER 4 hit (generic_ausnut) → id=${row.id} food_name="${row.food_name}"`);
     return {
       source: "generic_ausnut",
-      source_label: "AUSNUT2023",
+      source_label: "Unverified DB",
       matched: genericRowToPer100g(row),
     };
   }
@@ -417,7 +417,7 @@ async function matchIngredient(name) {
     );
     return {
       source: "ai_estimate",
-      source_label: "ai_estimate",
+      source_label: "AI estimate",
       matched: est,
     };
   }
@@ -522,6 +522,17 @@ async function resolveIngredients(parsedList) {
       ingredient,
       qty,
       unit,
+      // Always carry a `measurements` array so the ingredient management UI
+      // can edit single OR multi-measure ingredients uniformly. Single entry
+      // for the freshly-resolved row; the manager UI may add more.
+      measurements: [
+        {
+          qty,
+          unit,
+          grams: scaled.grams,
+          note: scaled.note || null,
+        },
+      ],
       grams: scaled.grams,
       matched_name: matched?.matched_name || null,
       source,
@@ -550,11 +561,144 @@ async function resolveIngredients(parsedList) {
   return out;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-measurement helpers (Kerry Dashboard ingredient management UI).
+//
+// A "measurement" is one { qty, unit } pair the coach types in. We sum the
+// resulting grams across measurements so an ingredient like "Oats — 40g or
+// 1/2 cup" can be expressed in BOTH ways at once if Kerry wants to show
+// athlete-facing equivalents. Grams = sum(qtyUnitToGrams across each).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Normalise an arbitrary client payload into [{ qty, unit }]. Always returns
+// at least one entry — empty input falls back to a single { qty: "", unit: "" }
+// row so the resolver still computes a sensible "default serving" grams value.
+function normalizeMeasurements(input, fallback) {
+  let arr = [];
+  if (Array.isArray(input) && input.length > 0) {
+    arr = input;
+  } else if (
+    fallback &&
+    (fallback.qty !== "" || fallback.unit !== "")
+  ) {
+    arr = [{ qty: fallback.qty || "", unit: fallback.unit || "" }];
+  }
+  const cleaned = arr
+    .map((m) => ({
+      qty: String(m?.qty ?? "").trim(),
+      unit: String(m?.unit ?? "").trim(),
+    }))
+    .filter((m) => m.qty !== "" || m.unit !== "");
+  if (cleaned.length === 0) cleaned.push({ qty: "", unit: "" });
+  return cleaned;
+}
+
+// Take a matched food (the per_100g + serving shape returned by matchIngredient)
+// plus the coach-edited measurement list and rebuild a `resolved_items` row
+// with summed grams + per-100g-scaled macros. Mirrors `scaleIngredient` but
+// supports multi-measurement aggregation.
+function rescaleResolvedRow({
+  matched,
+  source,
+  sourceLabel,
+  measurements,
+  ingredient,
+}) {
+  const safeName = String(ingredient || matched?.matched_name || "").trim();
+  const list = normalizeMeasurements(measurements, {
+    qty: "",
+    unit: "",
+  });
+
+  let totalGrams = 0;
+  const perMeasurement = [];
+  for (const m of list) {
+    const { grams, note } = qtyUnitToGrams(m.qty, m.unit, matched);
+    totalGrams += grams || 0;
+    perMeasurement.push({
+      qty: m.qty,
+      unit: m.unit,
+      grams: Math.round((grams || 0) * 10) / 10,
+      note: note || null,
+    });
+  }
+
+  const per100g = matched?.per_100g || {
+    protein_g: 0,
+    carb_g: 0,
+    fat_g: 0,
+    energy_kj: 0,
+    fibre_g: 0,
+    sodium_mg: 0,
+  };
+  const factor = totalGrams / 100;
+  const energyKj = (per100g.energy_kj || 0) * factor;
+  const macros = {
+    protein_g: round1((per100g.protein_g || 0) * factor),
+    carb_g: round1((per100g.carb_g || 0) * factor),
+    fat_g: round1((per100g.fat_g || 0) * factor),
+    energy_kj: round1(energyKj),
+    energy_kcal: Math.round(energyKj / 4.184),
+    fibre_g: round1((per100g.fibre_g || 0) * factor),
+    sodium_mg: round1((per100g.sodium_mg || 0) * factor),
+  };
+
+  // Primary qty/unit = the first measurement (back-compat with single-measure
+  // consumers like Prompt 4 and the legacy carousel UI).
+  const primary = perMeasurement[0] || { qty: "", unit: "" };
+
+  return {
+    ingredient: safeName,
+    qty: primary.qty,
+    unit: primary.unit,
+    measurements: perMeasurement,
+    grams: Math.round(totalGrams * 10) / 10,
+    matched_name: matched?.matched_name || safeName,
+    source,
+    source_label: sourceLabel,
+    food_id: matched?.food_id || null,
+    per_100g: per100g,
+    macros,
+    image: matched?.image || null,
+    serving_label: matched?.serving_label || null,
+    confidence: matched?.confidence ?? null,
+    needs_verification: !!matched?.needs_verification,
+    unit_note: primary.note,
+  };
+}
+
+// Load a `public.items` row by id and reshape into the per-100g + serving
+// payload the rescaler expects. Returns null if not found.
+async function loadItemForRescale(itemId) {
+  const id = Number(itemId);
+  if (!Number.isFinite(id)) return null;
+  const { rows } = await query(`SELECT * FROM public.items WHERE id = $1 LIMIT 1`, [id]);
+  if (!rows[0]) return null;
+  return itemRowToPer100g(rows[0]);
+}
+
+// Load a `public.generic_foods` row by id + source. Returns null if not found.
+async function loadGenericForRescale(id, source) {
+  const numId = Number(id);
+  if (!Number.isFinite(numId)) return null;
+  const { rows } = await query(
+    `SELECT * FROM public.generic_foods WHERE id = $1 AND source = $2 LIMIT 1`,
+    [numId, source],
+  );
+  if (!rows[0]) return null;
+  return genericRowToPer100g(rows[0]);
+}
+
 module.exports = {
   extractIngredients,
   matchIngredient,
   scaleIngredient,
   resolveIngredients,
+  rescaleResolvedRow,
+  loadItemForRescale,
+  loadGenericForRescale,
+  itemRowToPer100g,
+  genericRowToPer100g,
   // Exported for tests / reuse:
   fallbackExtractIngredients,
 };

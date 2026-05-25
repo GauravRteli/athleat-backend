@@ -14,6 +14,7 @@ const {
   getEerOverrides,
   saveEerOverrides,
 } = require("../services/studentService");
+const { getFoodPrefsCatalog: loadFoodPrefsCatalog } = require("../services/athleteService");
 
 async function getStudents(req, res, next) {
   try {
@@ -203,8 +204,18 @@ async function patchStudentEerOverrides(req, res, next) {
   }
 }
 
+async function getFoodPrefsCatalog(req, res, next) {
+  try {
+    const categories = await loadFoodPrefsCatalog();
+    return res.status(200).json({ categories });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   getStudents,
+  getFoodPrefsCatalog,
   patchStudentFeedback,
   patchMissionFeedback,
   patchQuestionReply,

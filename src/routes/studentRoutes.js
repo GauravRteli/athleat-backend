@@ -15,11 +15,13 @@ const {
   patchMissionSlotTitle,
   getStudentEerOverrides,
   patchStudentEerOverrides,
+  getFoodPrefsCatalog,
 } = require("../controllers/studentController");
 
 const router = express.Router();
 
 router.get("/", getStudents);
+router.get("/food-prefs/catalog", getFoodPrefsCatalog);
 router.patch("/:studentId/feedback", patchStudentFeedback);
 router.patch("/:studentId/missions/:missionId/feedback", patchMissionFeedback);
 router.patch("/:studentId/missions/:missionId/slot-desc", patchMissionSlotDesc);

@@ -39,7 +39,12 @@ const {
 const {
   extractIngredients,
   resolveIngredients,
+  rescaleResolvedRow,
+  loadItemForRescale,
+  loadGenericForRescale,
+  itemRowToPer100g,
 } = require("../services/kez/ingredientMatcher");
+const { shapeItem } = require("../services/foodsService");
 const {
   buildCandidatePool: buildV3CandidatePool,
   runPrompt3: runV3Prompt3,
@@ -437,17 +442,51 @@ async function mealAnalysisGet(req, res) {
     if (!student_id || !mission_id) {
       return res.status(400).json({ error: "student_id and mission_id required" });
     }
-    const { rows: data } = await query(
-      `SELECT * FROM public.meal_analysis
-       WHERE student_id = $1 AND mission_id = $2
-       ORDER BY created_at DESC
-       LIMIT 40`,
-      [student_id, mission_id],
-    );
+    const [{ rows: data }, { rows: prescreenRows }, { rows: eerRows }] =
+      await Promise.all([
+        query(
+          `SELECT * FROM public.meal_analysis
+            WHERE student_id = $1 AND mission_id = $2
+            ORDER BY created_at DESC
+            LIMIT 40`,
+          [student_id, mission_id],
+        ),
+        query(`SELECT * FROM public.prescreen WHERE student_id = $1`, [student_id]),
+        query(`SELECT * FROM public.eer_config WHERE id = 1`),
+      ]);
+    const prescreen = prescreenRows?.[0] || null;
+    const eerRow = eerRows?.[0] || null;
+    const eerConfig = eerRow
+      ? {
+          pal: eerRow.pal,
+          carb_gkg: eerRow.carb_gkg,
+          protein_gkg: eerRow.protein_gkg,
+          fat_gday: eerRow.fat_gday,
+        }
+      : {};
+
+    // Read-time fallback for `target_band` — older rows were saved without one
+    // because prescreen `dob`/`weight_kg` wasn't filled in yet. Recompute on the
+    // fly if the prescreen now has the data we need so the SLOT Target bar
+    // still renders without forcing the coach to re-analyse.
+    const hydrateTargetBand = (row) => {
+      if (row.target_band) return row;
+      if (!prescreen) return row;
+      const loadDay =
+        normalizeLoadDay(row.load_day) || classifyLoadFromPrescreen(prescreen);
+      const daily = computeDailyEER(prescreen, loadDay, eerConfig);
+      if (!daily) return row;
+      const lblForFraction = row.category || row.slot_id || "";
+      const fraction = mealFractionForSlot(lblForFraction);
+      const band = fraction > 0 ? mealTargetBand(daily, fraction) : null;
+      if (!band) return row;
+      return { ...row, target_band: band };
+    };
+
     const latestByKey = {};
     for (const row of data || []) {
       const k = `${row.slot_id}:${row.version}`;
-      if (!latestByKey[k]) latestByKey[k] = row;
+      if (!latestByKey[k]) latestByKey[k] = hydrateTargetBand(row);
     }
     res.json({ analyses: Object.values(latestByKey) });
   } catch (e) {
@@ -538,7 +577,7 @@ function buildPrompt4({
     "5. One genuine specific positive. Not generic.",
     "",
     "FORMAT RULES:",
-    "- Under 20-30 words.",
+    "- Under 20-30 words (hard limit 30 words).",
     "- Short paragraphs. No bullet points.",
     "- Address athlete as you throughout.",
     "- Never use the word healthy or unhealthy.",
@@ -2606,6 +2645,496 @@ async function estimateMacrosPost(req, res) {
   }
 }
 
+// =============================================================================
+// Ingredient Management endpoints (Kerry Dashboard v5.2 — Meal-analysis modal)
+// =============================================================================
+//
+// Four endpoints power the ingredient management UI inside the Kez Analysis
+// modal:
+//   GET    /api/kez/ingredients/search                  → cross-table search
+//   PATCH  /api/kez/meal-analysis/:id/resolved-items    → save edited list
+//   POST   /api/kez/ingredients/promote-to-verified     → unverified/AI → items
+//   POST   /api/kez/ingredients/:itemId/generate-image  → AI hero image
+//
+// All four share a single mental model: a resolved_items[i] row is the unit
+// of editing. The coach can change measurements, swap the matched food
+// (via search), or promote an unverified/AI ingredient into a locked
+// `public.items` row, and the modal will refresh totals via the PATCH.
+// =============================================================================
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+// Per-100g shape for a freshly-promoted (or coach-edited) ingredient that
+// doesn't yet live in any DB table. Used only inside the ingredient manager
+// to keep macro math consistent.
+function adhocMatchedFromPer100g({ name, per_100g, image, serving_g, serving_label }) {
+  const safe = (v) => Number.isFinite(Number(v)) ? Number(v) : 0;
+  return {
+    per_100g: {
+      protein_g: safe(per_100g?.protein_g),
+      carb_g: safe(per_100g?.carb_g),
+      fat_g: safe(per_100g?.fat_g),
+      energy_kj: safe(per_100g?.energy_kj),
+      fibre_g: safe(per_100g?.fibre_g),
+      sodium_mg: safe(per_100g?.sodium_mg),
+    },
+    serving_g: Number(serving_g) > 0 ? Number(serving_g) : 100,
+    serving_label: serving_label || null,
+    serving_size_unit: "g",
+    food_id: null,
+    matched_name: name || "Ingredient",
+    image: image || null,
+  };
+}
+
+// Recompute macro_totals + vs_targets for an entire resolved_items array.
+// Mirrors the math inside mealAnalysisPost so PATCH stays in sync with POST.
+function recomputeTotals(resolvedItems, targetBand) {
+  const lines = (resolvedItems || [])
+    .filter((r) => r && r.macros)
+    .map((r) => ({
+      protein_g: Number(r.macros.protein_g) || 0,
+      carb_g: Number(r.macros.carb_g) || 0,
+      fat_g: Number(r.macros.fat_g) || 0,
+      energy_kj: Number(r.macros.energy_kj) || 0,
+      energy_kcal: Number(r.macros.energy_kcal) || 0,
+    }));
+  const totalsFull = finalizeTotals(sumMacros(lines));
+  const macro_totals = {
+    ...totalsFull,
+    energy_kcal: totalsFull.kcal,
+    energy_kj: totalsFull.energy_kj,
+  };
+  const vs_targets = targetBand ? buildVsTargets(macro_totals, targetBand) : {};
+  return { macro_totals, vs_targets };
+}
+
+// =============================================================================
+// GET /api/kez/ingredients/search?q=…&limit=20
+// =============================================================================
+//
+// Cross-DB ingredient search powering the ingredient management modal's
+// search bar. Returns a single ordered list with Verified DB → Unverified DB
+// → Generic (AFCD/AUSNUT2023) so verified hits always sort first.
+//
+// Response: { results: [ {
+//   id (string composite key), source, sourceLabel,
+//   food_id (numeric — null for generic_foods rows),
+//   generic_id, generic_source,
+//   name, image_url, per_100g, serving_g, serving_label
+// }, ... ] }
+async function ingredientSearchGet(req, res) {
+  try {
+    const q = String(req.query.q || "").trim();
+    const limitTotal = Math.max(1, Math.min(40, Number(req.query.limit) || 20));
+    if (!q || q.length < 2) return res.json({ results: [] });
+
+    // Per-bucket budget — verified gets the most slots since coaches prefer it.
+    const slotVerified = Math.ceil(limitTotal * 0.4);
+    const slotUnverified = Math.ceil(limitTotal * 0.25);
+    const slotAfcd = Math.ceil(limitTotal * 0.2);
+    const slotAusnut = Math.ceil(limitTotal * 0.2);
+
+    const like = `%${q}%`;
+
+    const [verified, unverified, afcd, ausnut] = await Promise.all([
+      query(
+        `SELECT * FROM public.items
+          WHERE COALESCE(is_locked, false) = true AND title ILIKE $1
+          ORDER BY (LOWER(title) = LOWER($2)) DESC, length(title) ASC, id DESC
+          LIMIT $3`,
+        [like, q, slotVerified],
+      ),
+      query(
+        `SELECT * FROM public.items
+          WHERE COALESCE(is_locked, false) = false AND title ILIKE $1
+          ORDER BY (LOWER(title) = LOWER($2)) DESC, length(title) ASC, id DESC
+          LIMIT $3`,
+        [like, q, slotUnverified],
+      ),
+      query(
+        `SELECT * FROM public.generic_foods
+          WHERE COALESCE(is_active, true) = true
+            AND source = 'AFCD' AND food_name ILIKE $1
+          ORDER BY (LOWER(food_name) = LOWER($2)) DESC, length(food_name) ASC, id ASC
+          LIMIT $3`,
+        [like, q, slotAfcd],
+      ),
+      query(
+        `SELECT * FROM public.generic_foods
+          WHERE COALESCE(is_active, true) = true
+            AND source = 'AUSNUT2023' AND food_name ILIKE $1
+          ORDER BY (LOWER(food_name) = LOWER($2)) DESC, length(food_name) ASC, id ASC
+          LIMIT $3`,
+        [like, q, slotAusnut],
+      ),
+    ]);
+
+    const results = [];
+    for (const row of verified.rows) {
+      const shaped = itemRowToPer100g(row);
+      results.push({
+        id: `item:${row.id}`,
+        source: "items_verified",
+        sourceLabel: "Verified DB",
+        food_id: Number(row.id),
+        generic_id: null,
+        generic_source: null,
+        name: shaped.matched_name,
+        image_url: shaped.image || null,
+        per_100g: shaped.per_100g,
+        serving_g: shaped.serving_g,
+        serving_label: shaped.serving_label,
+      });
+    }
+    for (const row of unverified.rows) {
+      const shaped = itemRowToPer100g(row);
+      results.push({
+        id: `item:${row.id}`,
+        source: "items_unverified",
+        sourceLabel: "Unverified DB",
+        food_id: Number(row.id),
+        generic_id: null,
+        generic_source: null,
+        name: shaped.matched_name,
+        image_url: shaped.image || null,
+        per_100g: shaped.per_100g,
+        serving_g: shaped.serving_g,
+        serving_label: shaped.serving_label,
+      });
+    }
+    const genericRowToResult = (row, sourceKey, sourceLabel) => {
+      const num = (v) => {
+        if (v === null || v === undefined || v === "") return 0;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : 0;
+      };
+      return {
+        id: `generic:${sourceKey}:${row.id}`,
+        source: sourceKey === "AFCD" ? "generic_afcd" : "generic_ausnut",
+        sourceLabel,
+        food_id: null,
+        generic_id: Number(row.id),
+        generic_source: sourceKey,
+        name: row.food_name,
+        image_url: null,
+        per_100g: {
+          protein_g: num(row.protein_g),
+          carb_g: num(row.carb_g),
+          fat_g: num(row.fat_g),
+          energy_kj: num(row.energy_kj),
+          fibre_g: num(row.dietary_fibre_g),
+          sodium_mg: num(row.sodium_mg),
+        },
+        serving_g: 100,
+        serving_label: "100 g",
+      };
+    };
+    for (const row of afcd.rows) {
+      results.push(genericRowToResult(row, "AFCD", "Unverified DB · AFCD"));
+    }
+    for (const row of ausnut.rows) {
+      results.push(genericRowToResult(row, "AUSNUT2023", "Unverified DB · AUSNUT"));
+    }
+
+    res.json({ results: results.slice(0, limitTotal) });
+  } catch (e) {
+    console.error("ingredientSearchGet", e);
+    res.status(500).json({ error: e.message || "Search failed" });
+  }
+}
+
+// =============================================================================
+// PATCH /api/kez/meal-analysis/:id/resolved-items
+// =============================================================================
+//
+// Body: { resolved_items: [ <client row>, ... ] }
+//
+// Each client row may contain:
+//   - existing source + food_id / generic_id / generic_source / per_100g
+//   - measurements: [{ qty, unit }, ...]   (preferred)
+//   - or top-level qty + unit             (back-compat)
+//   - ingredient (display name override)
+//   - per_100g + matched_name + image     (for ai_estimate / coach-edited rows)
+//
+// The server rehydrates each row from canonical DB data when possible
+// (items_verified / items_unverified / generic_*), otherwise falls back to
+// the client-supplied per_100g (ai_estimate / coach-edited).
+// Then recomputes macro_totals + vs_targets and persists.
+// Returns the full refreshed analysis row.
+async function mealAnalysisResolvedItemsPatch(req, res) {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ error: "id required" });
+
+    const clientItems = Array.isArray(req.body?.resolved_items)
+      ? req.body.resolved_items
+      : null;
+    if (!clientItems) {
+      return res.status(400).json({ error: "resolved_items array required" });
+    }
+
+    const { rows } = await query(
+      `SELECT id, target_band FROM public.meal_analysis WHERE id = $1`,
+      [id],
+    );
+    const existing = rows?.[0];
+    if (!existing) return res.status(404).json({ error: "Analysis not found" });
+    const targetBand = existing.target_band || null;
+
+    // Resolve each client row → canonical per-100g shape → rescaled row.
+    const rebuilt = [];
+    for (const c of clientItems) {
+      const source = String(c?.source || "").trim() || "ai_estimate";
+      const sourceLabelMap = {
+        items_verified: "Verified DB",
+        items_unverified: "Verified DB",
+        generic_afcd: "Unverified DB",
+        generic_ausnut: "Unverified DB",
+        ai_estimate: "AI estimate",
+        unresolved: "unresolved",
+      };
+      const sourceLabel = c?.source_label || sourceLabelMap[source] || source;
+      const measurements = c?.measurements;
+      const ingredientName =
+        c?.ingredient ||
+        c?.matched_name ||
+        c?.name ||
+        "Ingredient";
+
+      let matched = null;
+      if (source === "items_verified" || source === "items_unverified") {
+        const itemId = c?.food_id || c?.item_id;
+        matched = await loadItemForRescale(itemId);
+      } else if (source === "generic_afcd") {
+        matched = await loadGenericForRescale(c?.generic_id, "AFCD");
+      } else if (source === "generic_ausnut") {
+        matched = await loadGenericForRescale(c?.generic_id, "AUSNUT2023");
+      }
+      // Fallback: use the client-supplied per_100g (ai_estimate /
+      // coach-edited unverified entries).
+      if (!matched) {
+        matched = adhocMatchedFromPer100g({
+          name: c?.matched_name || ingredientName,
+          per_100g: c?.per_100g || {},
+          image: c?.image,
+          serving_g: c?.serving_g,
+          serving_label: c?.serving_label,
+        });
+      }
+
+      const row = rescaleResolvedRow({
+        matched,
+        source,
+        sourceLabel,
+        measurements: measurements || (c?.qty || c?.unit ? [{ qty: c.qty, unit: c.unit }] : []),
+        ingredient: ingredientName,
+      });
+      // Preserve coach-flagged needs_verification + confidence if client sent them.
+      if (c?.needs_verification != null) row.needs_verification = !!c.needs_verification;
+      if (c?.confidence != null) row.confidence = c.confidence;
+      rebuilt.push(row);
+    }
+
+    const { macro_totals, vs_targets } = recomputeTotals(rebuilt, targetBand);
+
+    // Update flags re: sources after the edit.
+    const sourceSummary = rebuilt.reduce((acc, r) => {
+      acc[r.source] = (acc[r.source] || 0) + 1;
+      return acc;
+    }, {});
+
+    const { rows: updRows } = await query(
+      `UPDATE public.meal_analysis
+         SET resolved_items = $2::jsonb,
+             macro_totals   = $3::jsonb,
+             vs_targets     = $4::jsonb,
+             model_meta     = COALESCE(model_meta, '{}'::jsonb)
+                              || jsonb_build_object(
+                                   'ingredient_sources_summary', $5::jsonb,
+                                   'last_ingredient_edit_at',     to_jsonb(now())
+                                 ),
+             updated_at     = now()
+       WHERE id = $1
+       RETURNING *`,
+      [
+        id,
+        jsonbString(rebuilt),
+        jsonbString(macro_totals),
+        jsonbString(vs_targets),
+        jsonbString(sourceSummary),
+      ],
+    );
+
+    const updated = updRows?.[0];
+    if (!updated) return res.status(500).json({ error: "Update failed" });
+
+    res.json({
+      ok: true,
+      analysis_id: updated.id,
+      resolved_items: updated.resolved_items,
+      macro_totals: updated.macro_totals,
+      target_band: updated.target_band,
+      vs_targets: updated.vs_targets,
+      ingredient_sources_summary: sourceSummary,
+    });
+  } catch (e) {
+    console.error("mealAnalysisResolvedItemsPatch", e);
+    res.status(500).json({ error: e.message || "Update failed" });
+  }
+}
+
+// =============================================================================
+// POST /api/kez/ingredients/promote-to-verified
+// =============================================================================
+//
+// Insert a new row into `public.items` with `is_locked = true` from an
+// unverified DB / generic / AI-estimate ingredient that the coach has
+// reviewed. Returns the new row so the modal can swap the resolved_items
+// entry over to source = items_verified + food_id = <new id>.
+//
+// Body: {
+//   name,                          // required
+//   per_100g: { protein_g, carb_g, fat_g, energy_kj, fibre_g?, sodium_mg? },
+//   serving_g?,                    // defaults to 100
+//   serving_label?,
+//   image_url?,
+//   category_id?, category?,
+//   source_meta?                   // free-form provenance (logged-only)
+// }
+async function ingredientPromotePost(req, res) {
+  try {
+    const b = req.body || {};
+    const name = String(b.name || b.title || "").trim();
+    if (!name) return res.status(400).json({ error: "name required" });
+    const per = b.per_100g || {};
+    const num = (v) => {
+      if (v === null || v === undefined || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const energyKj = num(per.energy_kj);
+    const energyStr = energyKj != null ? `${energyKj}kJ` : null;
+    const fibre = num(per.fibre_g);
+    const sodium = num(per.sodium_mg);
+
+    const servingG = Number(b.serving_g) > 0 ? Number(b.serving_g) : 100;
+
+    // Insert into the legacy `public.items` table — same columns the foodsService
+    // uses, with `is_locked = true` so the next ingredient resolve picks it
+    // up via Tier 1 (verified).
+    const { rows } = await query(
+      `INSERT INTO public.items
+         (title, description, note, protein, carbs, fat, energy,
+          dietary_fibre, sodium,
+          serving_size, serving_size_unit,
+          category, image, is_locked, category_id, created_at, updated_at)
+       VALUES
+         ($1, $2, $3, $4, $5, $6, $7,
+          $8, $9,
+          $10, $11,
+          $12, $13, true, $14, now(), now())
+       RETURNING *`,
+      [
+        name,
+        b.description || null,
+        b.note || `Promoted from ${b.previous_source || "ingredient manager"}`,
+        num(per.protein_g) ?? 0,
+        num(per.carb_g) ?? 0,
+        num(per.fat_g) ?? 0,
+        energyStr,
+        fibre != null ? `${fibre}g` : null,
+        sodium != null ? `${sodium}mg` : null,
+        String(servingG),
+        b.serving_size_unit || "g",
+        b.category || null,
+        b.image_url || null,
+        b.category_id || null,
+      ],
+    );
+
+    const inserted = rows?.[0];
+    if (!inserted?.id) return res.status(500).json({ error: "Promote failed" });
+
+    const shaped = shapeItem(inserted);
+    res.json({
+      ok: true,
+      item: shaped,
+      item_id: Number(inserted.id),
+      source: "items_verified",
+      source_label: "Verified DB",
+    });
+  } catch (e) {
+    console.error("ingredientPromotePost", e);
+    res.status(500).json({ error: e.message || "Promote failed" });
+  }
+}
+
+// =============================================================================
+// POST /api/kez/ingredients/:itemId/generate-image
+// =============================================================================
+//
+// Generate + upload an AI image for a single ingredient and persist it on
+// `public.items.image`. Only allowed for items currently in the verified
+// table (i.e. promoted first). Returns the cloudinary URL + the prompt used.
+//
+// Body: { prompt? }   // optional override; otherwise built from the item's title
+async function ingredientGenerateImagePost(req, res) {
+  try {
+    if (!OPENAI_API_KEY) {
+      return res.status(503).json({ error: "OPENAI_API_KEY not configured" });
+    }
+    const itemId = Number(req.params.itemId);
+    if (!Number.isFinite(itemId)) {
+      return res.status(400).json({ error: "itemId required" });
+    }
+    const { rows } = await query(
+      `SELECT id, title, description FROM public.items WHERE id = $1`,
+      [itemId],
+    );
+    const item = rows?.[0];
+    if (!item) return res.status(404).json({ error: "Item not found" });
+
+    const customPrompt = String(req.body?.prompt || "").trim();
+    const seed =
+      customPrompt ||
+      `Single ingredient close-up: ${item.title}. ` +
+        (item.description ? `${String(item.description).slice(0, 200)}. ` : "") +
+        "Editorial food photography, top-down or 45° angle, soft natural daylight, " +
+        "clean light wood or neutral linen surface, fresh look, no labels, no text, no people.";
+    const prompt = seed
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 3800);
+
+    const { ref, model } = await generateImageWithFallback(prompt);
+    if (!ref) return res.status(502).json({ error: "Image generation returned no payload" });
+
+    const uploaded = ref.startsWith("data:")
+      ? await uploadImage(ref, { folder: "items" })
+      : await uploadRemoteUrl(ref, { folder: "items" });
+    if (!uploaded?.url) {
+      return res.status(502).json({ error: "Cloudinary upload failed" });
+    }
+
+    await query(
+      `UPDATE public.items SET image = $2, updated_at = now() WHERE id = $1`,
+      [itemId, uploaded.url],
+    );
+
+    res.json({
+      ok: true,
+      item_id: itemId,
+      image_url: uploaded.url,
+      prompt_used: prompt,
+      model,
+    });
+  } catch (e) {
+    console.error("ingredientGenerateImagePost", e);
+    res.status(500).json({ error: e.message || "Image generation failed" });
+  }
+}
+
 module.exports = {
   mealAnalysisGet,
   mealAnalysisPost,
@@ -2618,4 +3147,8 @@ module.exports = {
   saveSuggestionPost,
   mealImageGeneratePost,
   estimateMacrosPost,
+  ingredientSearchGet,
+  mealAnalysisResolvedItemsPatch,
+  ingredientPromotePost,
+  ingredientGenerateImagePost,
 };

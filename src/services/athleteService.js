@@ -165,6 +165,61 @@ function shapeMission(row) {
   };
 }
 
+/** Pull Fuel/Repair/Protect tags from meal_analysis.model_meta (Kez Prompt 4). */
+function tagsFromMealAnalysisMeta(modelMeta) {
+  if (!modelMeta) return null;
+  let meta = modelMeta;
+  if (typeof meta === "string") {
+    try {
+      meta = JSON.parse(meta);
+    } catch {
+      return null;
+    }
+  }
+  const tags = meta?.tags;
+  if (!tags || typeof tags !== "object") return null;
+  const fuel = tags.fuel != null ? String(tags.fuel) : "";
+  const repair = tags.repair != null ? String(tags.repair) : "";
+  const protect = tags.protect != null ? String(tags.protect) : "";
+  if (!fuel && !repair && !protect) return null;
+  return { fuel, repair, protect };
+}
+
+/** Attach latest Kez analysis tags onto mission v1/v2/v3 slot JSON for the athlete UI. */
+async function attachMealAnalysisTagsToMissions(studentId, missions) {
+  const { rows } = await query(
+    `SELECT DISTINCT ON (mission_id, slot_id, version)
+            mission_id, slot_id, version, model_meta
+       FROM public.meal_analysis
+      WHERE student_id = $1
+      ORDER BY mission_id, slot_id, version, created_at DESC`,
+    [studentId],
+  );
+
+  for (const row of rows) {
+    const mission = missions[row.mission_id];
+    if (!mission) continue;
+    const tags = tagsFromMealAnalysisMeta(row.model_meta);
+    if (!tags) continue;
+
+    const verKey = row.version === "v2" ? "v2" : row.version === "v3" ? "v3" : "v1";
+    const slotId = row.slot_id;
+    if (!slotId) continue;
+
+    const versionData = mission[verKey];
+    const base =
+      versionData && typeof versionData === "object" && !Array.isArray(versionData)
+        ? versionData
+        : {};
+    const slotPayload =
+      base[slotId] && typeof base[slotId] === "object" ? { ...base[slotId] } : {};
+    base[slotId] = { ...slotPayload, tags };
+    mission[verKey] = base;
+  }
+
+  return missions;
+}
+
 async function getAthleteMissions(studentId) {
   const result = await query(
     `SELECT *
@@ -220,6 +275,8 @@ async function getAthleteMissions(studentId) {
         v23Key: keys.v23,
       });
   });
+
+  await attachMealAnalysisTagsToMissions(studentId, missions);
 
   return missions;
 }
