@@ -1,6 +1,12 @@
 const { query } = require("../config/postgres");
 const { getEerConfig } = require("./eerConfigService");
 const { computeDailyEER, classifyLoadFromPrescreen } = require("./kez/targets");
+const {
+  filterUnlocksForProgression,
+  isModuleUnlockAllowed,
+  isMissionGroupAccessible,
+  missionModuleKeys,
+} = require("./unlockProgression");
 const MISSION_IDS = ["m1", "m2", "m3", "m4", "m5"];
 
 function splitName(fullName) {
@@ -47,14 +53,43 @@ async function getAthleteMe(studentId) {
     `SELECT module_key FROM public.student_unlocks WHERE student_id = $1 ORDER BY unlocked_at ASC`,
     [studentId],
   );
-  const unlocks = ["pre-screen", ...unlockRes.rows.map((r) => r.module_key)].filter(
+  const rawUnlocks = ["pre-screen", ...unlockRes.rows.map((r) => r.module_key)].filter(
     (v, i, arr) => arr.indexOf(v) === i,
   );
+
+  const [missions, foodPrefs, prescreenRes] = await Promise.all([
+    getAthleteMissions(studentId),
+    getFoodPrefs(studentId),
+    query(`SELECT 1 FROM public.prescreen WHERE student_id = $1 LIMIT 1`, [studentId]),
+  ]);
+  const unlocks = filterUnlocksForProgression(rawUnlocks, missions, {
+    prescreenDone: prescreenRes.rows.length > 0,
+    foodPrefsDone: !!foodPrefs.completedAt,
+  });
 
   return { athlete: shapeAthlete(row), unlocks };
 }
 
 async function upsertUnlock(studentId, moduleKey) {
+  const unlockRes = await query(
+    `SELECT module_key FROM public.student_unlocks WHERE student_id = $1`,
+    [studentId],
+  );
+  const rawUnlocks = ["pre-screen", ...unlockRes.rows.map((r) => r.module_key)];
+  const missions = await getAthleteMissions(studentId);
+  const foodPrefs = await getFoodPrefs(studentId);
+  const prescreenRes = await query(
+    `SELECT 1 FROM public.prescreen WHERE student_id = $1 LIMIT 1`,
+    [studentId],
+  );
+  const gates = {
+    prescreenDone: prescreenRes.rows.length > 0,
+    foodPrefsDone: !!foodPrefs.completedAt,
+  };
+  if (!isModuleUnlockAllowed(moduleKey, rawUnlocks, missions, gates)) {
+    return { moduleKey, skipped: true, reason: "Prerequisite step not complete." };
+  }
+
   const res = await query(
     `INSERT INTO public.student_unlocks (student_id, module_key, unlocked_at)
      VALUES ($1, $2, now())
@@ -159,6 +194,30 @@ async function getAthleteMissions(studentId) {
         feedbackStatus: "none",
         feedbackApprovedAt: null,
       };
+  });
+
+  const [unlockRes, foodPrefs, prescreenRes] = await Promise.all([
+    query(
+      `SELECT module_key FROM public.student_unlocks WHERE student_id = $1`,
+      [studentId],
+    ),
+    getFoodPrefs(studentId),
+    query(`SELECT 1 FROM public.prescreen WHERE student_id = $1 LIMIT 1`, [studentId]),
+  ]);
+  const rawUnlocks = ["pre-screen", ...unlockRes.rows.map((r) => r.module_key)];
+  const effectiveUnlocks = filterUnlocksForProgression(rawUnlocks, missions, {
+    prescreenDone: prescreenRes.rows.length > 0,
+    foodPrefsDone: !!foodPrefs.completedAt,
+  });
+
+  MISSION_IDS.forEach((missionId, idx) => {
+    const keys = missionModuleKeys(idx);
+    missions[missionId].unlocked = isMissionGroupAccessible(
+      idx,
+      missions,
+      effectiveUnlocks,
+      { v1Key: keys.v1, v23Key: keys.v23 },
+    );
   });
 
   return missions;
@@ -299,6 +358,7 @@ module.exports = {
   getAthleteMe,
   getAthleteMissions,
   upsertUnlock,
+  filterUnlocksForProgression,
   applyUnlockProgression,
   getFoodPrefs,
   upsertFoodPrefs,

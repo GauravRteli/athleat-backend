@@ -98,6 +98,14 @@ async function postSubmitMissionV1(req, res, next) {
     );
     return res.status(200).json({ ok: true, ...data });
   } catch (error) {
+    if (error?.code === "MISSION_LOCKED") {
+      return res.status(error.statusCode || 409).json({
+        ok: false,
+        error: error.message,
+        code: error.code,
+        missionId: error.missionId,
+      });
+    }
     return next(error);
   }
 }
@@ -113,6 +121,14 @@ async function postSubmitMissionV2(req, res, next) {
     );
     return res.status(200).json({ ok: true, ...data });
   } catch (error) {
+    if (error?.code === "MISSION_LOCKED") {
+      return res.status(error.statusCode || 409).json({
+        ok: false,
+        error: error.message,
+        code: error.code,
+        missionId: error.missionId,
+      });
+    }
     return next(error);
   }
 }

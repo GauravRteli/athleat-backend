@@ -538,7 +538,7 @@ function buildPrompt4({
     "5. One genuine specific positive. Not generic.",
     "",
     "FORMAT RULES:",
-    "- Under 150 words.",
+    "- Under 20-30 words.",
     "- Short paragraphs. No bullet points.",
     "- Address athlete as you throughout.",
     "- Never use the word healthy or unhealthy.",

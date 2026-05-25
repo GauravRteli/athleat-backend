@@ -6,12 +6,82 @@ function isValidMissionId(missionId) {
   return MISSION_IDS.includes(missionId);
 }
 
+// Linear mission unlock used for the Kerry dashboard read-only view (does NOT
+// look at prescreen / food-prefs). The strict submit-time gate is in
+// `assertSubmissionAllowed` below.
 function isMissionUnlocked(missionsById, missionId) {
   if (missionId === "m1") return true;
   const idx = MISSION_IDS.indexOf(missionId);
   if (idx <= 0) return false;
   const prevId = MISSION_IDS[idx - 1];
-  return missionsById[prevId]?.status === "submitted";
+  // Spec: next mission's V1 only opens AFTER the previous mission's V2 is in.
+  return !!missionsById[prevId]?.v2SubmittedAt;
+}
+
+// Strict per-submission gate. Returns `{ ok: true }` or `{ ok: false, reason }`
+// so the frontend can show a meaningful message instead of "Mission is locked".
+// Rules (matches the athlete-dashboard unlock chain):
+//   - V1 of m1 requires `student_food_preferences.completed_at` (which itself
+//     implies the prescreen step because food-prefs only unlocks after
+//     prescreen via `applyUnlockProgression`).
+//   - V1 of m2..m5 requires the PREVIOUS mission's V2 submission
+//     (`missions.v2_submitted_at`).
+//   - V2 of any mission requires that mission's V1 submission
+//     (`missions.submitted_at`).
+async function assertSubmissionAllowed(studentId, missionId, versionKey) {
+  if (!isValidMissionId(missionId)) {
+    return { ok: false, reason: "Invalid mission id." };
+  }
+  if (!["v1", "v2"].includes(versionKey)) {
+    return { ok: false, reason: "Invalid mission version." };
+  }
+
+  if (versionKey === "v2") {
+    const r = await query(
+      `SELECT submitted_at FROM public.missions
+        WHERE student_id = $1 AND mission_id = $2 LIMIT 1`,
+      [studentId, missionId],
+    );
+    if (r.rows[0]?.submitted_at) return { ok: true };
+    return {
+      ok: false,
+      reason: `Submit ${missionId.toUpperCase()} V1 first before V2.`,
+    };
+  }
+
+  // V1 — depends on the upstream step in the chain.
+  if (missionId === "m1") {
+    const r = await query(
+      `SELECT completed_at FROM public.student_food_preferences
+        WHERE student_id = $1 LIMIT 1`,
+      [studentId],
+    );
+    if (r.rows[0]?.completed_at) return { ok: true };
+
+    // No food-prefs row → check whether prescreen is even done so the FE
+    // can point the athlete at the right step.
+    const ps = await query(
+      `SELECT 1 FROM public.prescreen WHERE student_id = $1 LIMIT 1`,
+      [studentId],
+    );
+    if (!ps.rows.length) {
+      return { ok: false, reason: "Complete your Pre-Screen first." };
+    }
+    return { ok: false, reason: "Complete Food Preferences first." };
+  }
+
+  const idx = MISSION_IDS.indexOf(missionId);
+  const prevId = MISSION_IDS[idx - 1];
+  const r = await query(
+    `SELECT v2_submitted_at FROM public.missions
+      WHERE student_id = $1 AND mission_id = $2 LIMIT 1`,
+    [studentId, prevId],
+  );
+  if (r.rows[0]?.v2_submitted_at) return { ok: true };
+  return {
+    ok: false,
+    reason: `Submit ${prevId.toUpperCase()} V2 first before starting ${missionId.toUpperCase()}.`,
+  };
 }
 
 function countVersionPics(versionData) {
@@ -390,7 +460,13 @@ async function getStudentMissions(studentId) {
 async function saveMissionProgress(studentId, missionId, payload = {}) {
   if (!isValidMissionId(missionId)) throw new Error("Invalid mission id");
   const missions = await getStudentMissions(studentId);
-  if (!missions[missionId]?.unlocked) throw new Error("Mission is locked");
+  if (!missions[missionId]?.unlocked) {
+    const err = new Error("Mission is locked");
+    err.code = "MISSION_LOCKED";
+    err.statusCode = 409;
+    err.missionId = missionId;
+    throw err;
+  }
 
   const v1 = payload.v1 !== undefined ? payload.v1 : missions[missionId].v1;
   const v2 = payload.v2 !== undefined ? payload.v2 : missions[missionId].v2;
@@ -406,11 +482,18 @@ async function saveMissionProgress(studentId, missionId, payload = {}) {
 }
 
 async function submitMissionVersion(studentId, missionId, versionKey, versionData) {
-  if (!isValidMissionId(missionId)) throw new Error("Invalid mission id");
-  if (!["v1", "v2"].includes(versionKey)) throw new Error("Invalid mission version");
-
-  const missions = await getStudentMissions(studentId);
-  if (!missions[missionId]?.unlocked) throw new Error("Mission is locked");
+  // Strict unlock chain: prescreen → food-prefs → m1-v1 → m1-v2 → m2-v1 → ...
+  // Validation happens inside `assertSubmissionAllowed` (also handles
+  // invalid id / version inputs).
+  const gate = await assertSubmissionAllowed(studentId, missionId, versionKey);
+  if (!gate.ok) {
+    const err = new Error(gate.reason || "Mission is locked");
+    err.code = "MISSION_LOCKED";
+    err.statusCode = 409;
+    err.missionId = missionId;
+    err.versionKey = versionKey;
+    throw err;
+  }
   const isComplete = countVersionPics(versionData) >= 3;
 
   if (versionKey === "v1") {
@@ -555,6 +638,7 @@ module.exports = {
   getStudentMissions,
   saveMissionProgress,
   submitMissionVersion,
+  assertSubmissionAllowed,
   updateMissionSlotDesc,
   updateMissionSlotTitle,
   getEerOverrides,
