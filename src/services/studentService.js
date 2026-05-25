@@ -1,4 +1,5 @@
 const { query } = require("../config/postgres");
+const { toYyyyMmDd } = require("../utils/dateInput");
 const { applyUnlockProgression } = require("./athleteService");
 const MISSION_IDS = ["m1", "m2", "m3", "m4", "m5"];
 
@@ -175,7 +176,7 @@ async function listStudentsForDashboard() {
 function shapeDashboardStudent(s, ps, bp, missions, questions, foodPrefs) {
   const prescreen = ps
     ? {
-        dob: ps.dob,
+        dob: toYyyyMmDd(ps.dob) || ps.dob,
         schoolYear: ps.school_year,
         referral: ps.referral,
         ethnicity: ps.ethnicity,
@@ -300,6 +301,14 @@ async function replyToQuestion(questionId, reply) {
   );
 }
 
+function shapePrescreenRow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    dob: toYyyyMmDd(row.dob) || row.dob || null,
+  };
+}
+
 async function getStudentPrescreen(studentId) {
   const res = await query(
     `SELECT *
@@ -309,7 +318,7 @@ async function getStudentPrescreen(studentId) {
      LIMIT 1`,
     [studentId],
   );
-  return res.rows[0] || null;
+  return shapePrescreenRow(res.rows[0]) || null;
 }
 
 async function upsertStudentPrescreen(studentId, payload) {
