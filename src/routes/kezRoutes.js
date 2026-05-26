@@ -13,6 +13,7 @@ const {
   estimateMacrosPost,
   ingredientSearchGet,
   mealAnalysisResolvedItemsPatch,
+  mealAnalysisSendToAthletePost,
   ingredientPromotePost,
   ingredientGenerateImagePost,
 } = require("../controllers/kezController");
@@ -22,6 +23,7 @@ const router = express.Router();
 router.get("/meal-analysis", mealAnalysisGet);
 router.post("/meal-analysis", mealAnalysisPost);
 router.patch("/meal-analysis/:id/resolved-items", mealAnalysisResolvedItemsPatch);
+router.post("/meal-analysis/:id/send-to-athlete", mealAnalysisSendToAthletePost);
 router.post("/meal-analysis-v3", mealAnalysisV3Post);
 router.post("/meal-carousel", mealCarouselPost);
 router.get("/meal-carousel-drafts", mealCarouselDraftsGet);

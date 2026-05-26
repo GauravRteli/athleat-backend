@@ -16,6 +16,7 @@ const {
 } = require("../services/studentService");
 const { getMissionConfig } = require("../services/missionConfigService");
 const { postTestChat } = require("./chatController");
+const { query } = require("../config/postgres");
 
 async function getMe(req, res, next) {
   try {
@@ -179,6 +180,42 @@ async function postAthletePrescreen(req, res, next) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/athlete/meal-analysis/:id/submit
+//
+// Athlete acknowledges a Kez analysis Kerry has sent them. Stamped onto the
+// meal_analysis row itself (not the mission), so a fresh Kez run naturally
+// resets the submitted state on the new draft row.
+//
+// Only allowed if Kerry has already pressed "Send to athlete" (i.e.
+// sent_to_athlete_at IS NOT NULL) and the row belongs to req.auth.studentId.
+// ─────────────────────────────────────────────────────────────────────────────
+async function postSubmitMealAnalysis(req, res, next) {
+  try {
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ error: "analysis id required" });
+    const { rows } = await query(
+      `UPDATE public.meal_analysis
+          SET athlete_submitted_at = COALESCE(athlete_submitted_at, now()),
+              updated_at = now()
+        WHERE id = $1
+          AND student_id = $2
+          AND sent_to_athlete_at IS NOT NULL
+        RETURNING id, mission_id, slot_id, version,
+                  sent_to_athlete_at, athlete_submitted_at`,
+      [id, req.auth.studentId],
+    );
+    if (!rows.length) {
+      return res
+        .status(404)
+        .json({ error: "Analysis not found, not yours, or not yet sent." });
+    }
+    return res.status(200).json({ analysis: rows[0] });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   getMe,
   postUnlock,
@@ -193,4 +230,5 @@ module.exports = {
   getAthleteNutritionTargets,
   getAthletePrescreen,
   postAthletePrescreen,
+  postSubmitMealAnalysis,
 };

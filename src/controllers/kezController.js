@@ -3135,6 +3135,39 @@ async function ingredientGenerateImagePost(req, res) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/kez/meal-analysis/:id/send-to-athlete
+//
+// Kerry presses "Send to {firstName}" on a specific Kez analysis row. Until
+// this is set, the athlete dashboard does NOT show the Kez output, the
+// fuel/repair/protect tags, or the coach analysis. Re-running Kez creates a
+// fresh meal_analysis row with sent_to_athlete_at = NULL, so the athlete loses
+// access to the previous result automatically (which mirrors the user's
+// "if Kez Analysis is run then remove that button" requirement).
+// ─────────────────────────────────────────────────────────────────────────────
+async function mealAnalysisSendToAthletePost(req, res) {
+  try {
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ error: "analysis id required" });
+
+    const { rows } = await query(
+      `UPDATE public.meal_analysis
+          SET sent_to_athlete_at  = COALESCE(sent_to_athlete_at, now()),
+              athlete_submitted_at = NULL,
+              updated_at = now()
+        WHERE id = $1
+        RETURNING id, student_id, mission_id, slot_id, version,
+                  sent_to_athlete_at, athlete_submitted_at`,
+      [id],
+    );
+    if (!rows.length) return res.status(404).json({ error: "analysis not found" });
+    res.json({ analysis: rows[0] });
+  } catch (e) {
+    console.error("mealAnalysisSendToAthletePost", e);
+    res.status(500).json({ error: e.message || "send failed" });
+  }
+}
+
 module.exports = {
   mealAnalysisGet,
   mealAnalysisPost,
@@ -3149,6 +3182,7 @@ module.exports = {
   estimateMacrosPost,
   ingredientSearchGet,
   mealAnalysisResolvedItemsPatch,
+  mealAnalysisSendToAthletePost,
   ingredientPromotePost,
   ingredientGenerateImagePost,
 };

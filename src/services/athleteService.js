@@ -185,13 +185,34 @@ function tagsFromMealAnalysisMeta(modelMeta) {
   return { fuel, repair, protect };
 }
 
-/** Attach latest Kez analysis tags onto mission v1/v2/v3 slot JSON for the athlete UI. */
+/**
+ * Attach the LATEST Kez analysis Kerry has sent onto each mission v1/v2/v3
+ * slot for the athlete UI.
+ *
+ * Gating rules (must mirror frontend expectations):
+ *   • Only rows where `sent_to_athlete_at IS NOT NULL` are surfaced.
+ *   • If Kerry re-runs Kez a fresh row is INSERTed (no defaults), so the
+ *     athlete instantly loses access to the previous analysis until Kerry
+ *     presses "Send to athlete" again on the new one.
+ *   • `athlete_submitted_at` powers the "Submit / ✓ Re-submitted" toggle.
+ *
+ * Per-slot payload added:
+ *   {
+ *     analysisId, sentAt, submittedAt,
+ *     coachAnalysis (Kez Prompt-4 feedback_text),
+ *     loadDay, mealText, macros, target, tags
+ *   }
+ */
 async function attachMealAnalysisTagsToMissions(studentId, missions) {
   const { rows } = await query(
     `SELECT DISTINCT ON (mission_id, slot_id, version)
-            mission_id, slot_id, version, model_meta
+            id, mission_id, slot_id, version,
+            load_day, meal_text, feedback_text,
+            macro_totals, target_band, vs_targets,
+            model_meta, sent_to_athlete_at, athlete_submitted_at
        FROM public.meal_analysis
       WHERE student_id = $1
+        AND sent_to_athlete_at IS NOT NULL
       ORDER BY mission_id, slot_id, version, created_at DESC`,
     [studentId],
   );
@@ -199,13 +220,12 @@ async function attachMealAnalysisTagsToMissions(studentId, missions) {
   for (const row of rows) {
     const mission = missions[row.mission_id];
     if (!mission) continue;
-    const tags = tagsFromMealAnalysisMeta(row.model_meta);
-    if (!tags) continue;
-
-    const verKey = row.version === "v2" ? "v2" : row.version === "v3" ? "v3" : "v1";
     const slotId = row.slot_id;
     if (!slotId) continue;
+    const verKey =
+      row.version === "v2" ? "v2" : row.version === "v3" ? "v3" : "v1";
 
+    const tags = tagsFromMealAnalysisMeta(row.model_meta);
     const versionData = mission[verKey];
     const base =
       versionData && typeof versionData === "object" && !Array.isArray(versionData)
@@ -213,7 +233,24 @@ async function attachMealAnalysisTagsToMissions(studentId, missions) {
         : {};
     const slotPayload =
       base[slotId] && typeof base[slotId] === "object" ? { ...base[slotId] } : {};
-    base[slotId] = { ...slotPayload, tags };
+
+    const sentKez = {
+      analysisId: row.id,
+      sentAt: row.sent_to_athlete_at,
+      submittedAt: row.athlete_submitted_at,
+      coachAnalysis: row.feedback_text || "",
+      loadDay: row.load_day || null,
+      mealText: row.meal_text || "",
+      macros: row.macro_totals || {},
+      target: row.target_band || {},
+      vsTargets: row.vs_targets || {},
+    };
+
+    base[slotId] = {
+      ...slotPayload,
+      ...(tags ? { tags } : {}),
+      sentKez,
+    };
     mission[verKey] = base;
   }
 

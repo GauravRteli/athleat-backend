@@ -13,6 +13,7 @@ const {
   getAthleteNutritionTargets,
   getAthletePrescreen,
   postAthletePrescreen,
+  postSubmitMealAnalysis,
 } = require("../controllers/athleteController");
 const {
   getMyTrainingPlan,
@@ -40,6 +41,9 @@ router.get("/nutrition-targets", getAthleteNutritionTargets);
 router.get("/mission-config", getMissionConfigForAthlete);
 router.post("/missions/:missionId/submit-v1", postSubmitMissionV1);
 router.post("/missions/:missionId/submit-v2", postSubmitMissionV2);
+
+// Athlete acknowledges a Kez analysis Kerry has sent them.
+router.post("/meal-analysis/:id/submit", postSubmitMealAnalysis);
 
 // Planning Tools (v4 Athlete Dashboard — native JSX components)
 router.get ("/training-plan", getMyTrainingPlan);
