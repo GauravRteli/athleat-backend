@@ -209,6 +209,7 @@ async function attachMealAnalysisTagsToMissions(studentId, missions) {
             id, mission_id, slot_id, version,
             load_day, meal_text, feedback_text,
             macro_totals, target_band, vs_targets,
+            resolved_items,
             model_meta, sent_to_athlete_at, athlete_submitted_at
        FROM public.meal_analysis
       WHERE student_id = $1
@@ -244,6 +245,12 @@ async function attachMealAnalysisTagsToMissions(studentId, missions) {
       macros: row.macro_totals || {},
       target: row.target_band || {},
       vsTargets: row.vs_targets || {},
+      // Ingredient breakdown (qty + units + grams + macros per item) —
+      // required by the athlete-side Shopping List PDF so V1/V2 meal picks
+      // can contribute real ingredient rows to the aggregated list. Gated
+      // by sent_to_athlete_at above so athletes only see analyses Kerry
+      // has explicitly released.
+      resolvedItems: Array.isArray(row.resolved_items) ? row.resolved_items : [],
     };
 
     base[slotId] = {

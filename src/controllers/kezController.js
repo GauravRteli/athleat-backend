@@ -3145,6 +3145,56 @@ async function ingredientGenerateImagePost(req, res) {
 // access to the previous result automatically (which mirrors the user's
 // "if Kez Analysis is run then remove that button" requirement).
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * PATCH /api/kez/meal-analysis/:id/feedback
+ *
+ * Lets Kerry edit the AI-generated coaching feedback prose after the fact.
+ * The body shape is:
+ *
+ *   { feedback_text: string }     // required, may be empty string → blanks it
+ *
+ * Returns `{ analysis }` with the persisted row (id, feedback_text, gate
+ * timestamps, etc.) so the dashboard can patch its local copy without a
+ * full re-fetch. The send-to-athlete gate is intentionally NOT cleared —
+ * Kerry's intent here is "fix the wording", not "regenerate the analysis";
+ * the athlete dashboard will pick up the new prose on its next refresh.
+ */
+async function mealAnalysisFeedbackPatch(req, res) {
+  try {
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ error: "analysis id required" });
+
+    const body = req.body || {};
+    if (typeof body.feedback_text !== "string") {
+      return res
+        .status(400)
+        .json({ error: "feedback_text must be a string" });
+    }
+    const feedbackText = body.feedback_text.trim();
+
+    const { rows } = await query(
+      `UPDATE public.meal_analysis
+          SET feedback_text = $1,
+              updated_at    = now()
+        WHERE id = $2
+        RETURNING id, student_id, mission_id, slot_id, version,
+                  feedback_text, feedback_status,
+                  sent_to_athlete_at, athlete_submitted_at,
+                  updated_at`,
+      [feedbackText, id],
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: "analysis not found" });
+    }
+    return res.json({ analysis: rows[0] });
+  } catch (e) {
+    console.error("mealAnalysisFeedbackPatch", e);
+    return res
+      .status(500)
+      .json({ error: e.message || "feedback update failed" });
+  }
+}
+
 async function mealAnalysisSendToAthletePost(req, res) {
   try {
     const id = req.params.id;
@@ -3182,6 +3232,7 @@ module.exports = {
   estimateMacrosPost,
   ingredientSearchGet,
   mealAnalysisResolvedItemsPatch,
+  mealAnalysisFeedbackPatch,
   mealAnalysisSendToAthletePost,
   ingredientPromotePost,
   ingredientGenerateImagePost,
