@@ -1461,7 +1461,7 @@ async function mealCarouselPost(req, res) {
     });
 
     // ── STEP 2 · candidate pool (vector + re-rank) ────────────────────────
-    const { pool, leftover, embedded } = await buildV3CandidatePool({
+    const { pool, leftover, embedded, anchorTokens } = await buildV3CandidatePool({
       category,
       slotLabel: lbl,
       v1MealText: v1Row?.meal_text || null,
@@ -1536,6 +1536,7 @@ async function mealCarouselPost(req, res) {
       v2,
       band: targetBand,
       pool: workingPool,
+      coreAnchors: anchorTokens || [],
     });
 
     console.log(
@@ -1614,6 +1615,7 @@ async function mealCarouselPost(req, res) {
       embedded,
       pool_size: workingPool.length,
       leftover_size: leftover?.length || 0,
+      core_anchors: anchorTokens || [],
       analysis_id: analysis?.id || null,
     };
 
@@ -3168,6 +3170,27 @@ async function mealAnalysisSendToAthletePost(req, res) {
   }
 }
 
+// Generic AI draft endpoint used by ViewSelectionsModal.
+// Keeps AI key ownership in backend only (frontend never needs provider keys).
+async function aiDraftPost(req, res) {
+  try {
+    const prompt = String(req.body?.prompt || "").trim();
+    const json = !!req.body?.json;
+    if (!prompt) return res.status(400).json({ error: "prompt required" });
+
+    const text = await callLlmText(prompt, {
+      json,
+      system: json
+        ? "You are Virtual Kez. Return VALID JSON only. No markdown, no preamble, no code fences."
+        : "",
+    });
+    return res.json({ text });
+  } catch (e) {
+    console.error("aiDraftPost", e);
+    return res.status(502).json({ error: e.message || "AI draft failed" });
+  }
+}
+
 module.exports = {
   mealAnalysisGet,
   mealAnalysisPost,
@@ -3183,6 +3206,7 @@ module.exports = {
   ingredientSearchGet,
   mealAnalysisResolvedItemsPatch,
   mealAnalysisSendToAthletePost,
+  aiDraftPost,
   ingredientPromotePost,
   ingredientGenerateImagePost,
 };

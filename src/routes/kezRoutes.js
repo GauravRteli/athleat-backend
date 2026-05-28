@@ -11,6 +11,7 @@ const {
   saveSuggestionPost,
   mealImageGeneratePost,
   estimateMacrosPost,
+  aiDraftPost,
   ingredientSearchGet,
   mealAnalysisResolvedItemsPatch,
   mealAnalysisSendToAthletePost,
@@ -33,6 +34,7 @@ router.post("/student-feedback-draft", studentFeedbackDraftPost);
 router.post("/save-suggestion", saveSuggestionPost);
 router.post("/generate-meal-image", mealImageGeneratePost);
 router.post("/estimate-macros", estimateMacrosPost);
+router.post("/ai-draft", aiDraftPost);
 
 // Ingredient management — modal inside Kez Analysis view
 router.get("/ingredients/search", ingredientSearchGet);

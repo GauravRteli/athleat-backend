@@ -1,5 +1,9 @@
 const env = require("../../config/env");
 
+function hasLlmApiKey() {
+  return Boolean(env.anthropic.apiKey || env.openai.apiKey);
+}
+
 function anthropicImageBlockFromUrl(imageUrl) {
   const trimmed = typeof imageUrl === "string" ? imageUrl.trim() : "";
   const m = /^data:(image\/[a-z0-9.+-]+);base64,([\s\S]+)$/i.exec(trimmed);
@@ -119,4 +123,4 @@ function extractJsonObject(text) {
   return match ? match[0] : null;
 }
 
-module.exports = { callLlmUserContent, callLlmText, extractJsonObject };
+module.exports = { callLlmUserContent, callLlmText, extractJsonObject, hasLlmApiKey };

@@ -6,7 +6,8 @@
   "main": "src/server.js",
   "scripts": {
     "dev": "nodemon src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "backfill:meal-embeddings": "node scripts/backfill-meal-embeddings.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

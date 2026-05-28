@@ -14,6 +14,7 @@
 const { pool, query } = require("../config/postgres");
 const { embedMealAndStore } = require("./mealEmbeddings");
 const { resolveStorageUrl } = require("../utils/storageUrl");
+const { randomUUID } = require("crypto");
 
 const num = (v) => {
   if (v === null || v === undefined || v === "") return null;
@@ -26,6 +27,31 @@ const parseEnergy = (val) => {
   const m = String(val).match(/-?\d+(?:\.\d+)?/);
   return m ? Number(m[0]) : null;
 };
+
+async function mealsIdMeta(client) {
+  const { rows } = await client.query(
+    `SELECT data_type, udt_name, column_default
+       FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'meals'
+        AND column_name = 'id'
+      LIMIT 1`,
+  );
+  return rows?.[0] || null;
+}
+
+async function nextNumericMealId(client) {
+  // Serialize id allocation when no DB default/sequence is available.
+  await client.query("LOCK TABLE public.meals IN EXCLUSIVE MODE");
+  const { rows } = await client.query(
+    `SELECT COALESCE(MAX(id), 0)::bigint + 1 AS next_id FROM public.meals`,
+  );
+  const next = Number(rows?.[0]?.next_id);
+  if (!Number.isFinite(next) || next <= 0) {
+    throw new Error("Failed to allocate numeric id for public.meals");
+  }
+  return next;
+}
 
 function totalsFromIngredients(rows) {
   return rows.reduce(
@@ -553,18 +579,53 @@ async function createMeal(payload) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const mealRes = await client.query(
-      `INSERT INTO public.meals (title, image, description, note, user_id)
-       VALUES ($1,$2,$3,$4,$5)
-       RETURNING *`,
-      [
-        payload.title,
-        payload.image_url || payload.image || null,
-        payload.description || null,
-        payload.blueprint_note || payload.blueprintNote || payload.note || null,
-        payload.user_id || null,
-      ],
-    );
+    const idMeta = await mealsIdMeta(client);
+    const idType = String(idMeta?.udt_name || "").toLowerCase();
+    const hasDefaultId = Boolean(idMeta?.column_default);
+    const needsExplicitId = !hasDefaultId;
+
+    const values = [
+      payload.title,
+      payload.image_url || payload.image || null,
+      payload.description || null,
+      payload.blueprint_note || payload.blueprintNote || payload.note || null,
+      payload.user_id || null,
+    ];
+
+    let mealRes;
+    if (needsExplicitId) {
+      if (idType === "uuid" || idType === "text" || idType === "varchar") {
+        const mealId = payload.id || payload.meal_id || randomUUID();
+        mealRes = await client.query(
+          `INSERT INTO public.meals (id, title, image, description, note, user_id)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           RETURNING *`,
+          [mealId, ...values],
+        );
+      } else if (idType === "int8" || idType === "int4" || idType === "int2") {
+        const provided = Number(payload.id ?? payload.meal_id);
+        const mealId = Number.isFinite(provided) && provided > 0
+          ? Math.trunc(provided)
+          : await nextNumericMealId(client);
+        mealRes = await client.query(
+          `INSERT INTO public.meals (id, title, image, description, note, user_id)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           RETURNING *`,
+          [mealId, ...values],
+        );
+      } else {
+        throw new Error(
+          `public.meals.id has no default and unsupported type (${idType || "unknown"}). Please add a DB default for id.`,
+        );
+      }
+    } else {
+      mealRes = await client.query(
+        `INSERT INTO public.meals (title, image, description, note, user_id)
+         VALUES ($1,$2,$3,$4,$5)
+         RETURNING *`,
+        values,
+      );
+    }
     const meal = mealRes.rows[0];
 
     if (foods.length) await replaceMealFoods(client, meal.id, foods);

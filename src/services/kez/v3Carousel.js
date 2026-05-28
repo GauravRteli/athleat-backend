@@ -26,17 +26,19 @@ const {
   buildAthleteQueryText,
   formatVectorLiteral,
 } = require("../mealEmbeddings");
-const { callLlmText, extractJsonObject } = require("./llm");
+const env = require("../../config/env");
+const { callLlmText, extractJsonObject, hasLlmApiKey } = require("./llm");
 
-// Ranking weights (sum to 1.0). Tunable — keep these in sync with the
-// docstring in the redesign plan.
-const W_SIM = 0.55;
+// Ranking weights (sum to 1.0). For "small swaps" we intentionally bias toward
+// ingredient continuity over pure semantic similarity.
+const W_SIM = 0.25;
 const W_OVERLAP = 0.3;
 const W_LIKED = 0.15;
+const W_ANCHOR = 0.3;
 
 // Re-rank pool size and Claude pool size.
-const VECTOR_K = 25;
-const CLAUDE_POOL_SIZE = 10;
+const VECTOR_K = 60;
+const CLAUDE_POOL_SIZE = 16;
 const FINAL_PICK_COUNT = 4;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,15 +49,53 @@ function lc(s) {
   return String(s || "").trim().toLowerCase();
 }
 
+const TOKEN_STOPWORDS = new Set([
+  "the", "and", "with", "for", "from", "into", "onto", "your", "meal",
+  "meals", "slot", "currently", "eats", "recently", "tried", "likes",
+  "avoid", "avoids", "version", "breakfast", "lunch", "dinner",
+  "training", "game", "day", "post", "pre", "toast",
+]);
+
+const TOKEN_ALIASES = {
+  avo: "avocado",
+  avos: "avocado",
+  avocados: "avocado",
+  yog: "yoghurt",
+  yogurt: "yoghurt",
+  yogurts: "yoghurt",
+  yoghurts: "yoghurt",
+  tomatos: "tomato",
+  tomatoes: "tomato",
+  eggs: "egg",
+  bananas: "banana",
+  berries: "berry",
+  chickens: "chicken",
+  breads: "bread",
+  wraps: "wrap",
+  pastas: "pasta",
+};
+
+function canonicalToken(raw) {
+  let t = lc(raw).replace(/[^a-z0-9]/g, "");
+  if (!t) return "";
+  if (TOKEN_ALIASES[t]) return TOKEN_ALIASES[t];
+  if (t.length > 4 && t.endsWith("es")) t = t.slice(0, -2);
+  else if (t.length > 3 && t.endsWith("s")) t = t.slice(0, -1);
+  return TOKEN_ALIASES[t] || t;
+}
+
 function tokensFromText(text) {
-  return new Set(
-    String(text || "")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]+/g, " ")
-      .split(/\s+/)
-      .map((w) => w.trim())
-      .filter((w) => w && w.length >= 3),
-  );
+  const out = new Set();
+  const words = String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, " ")
+    .split(/\s+/);
+  for (const w of words) {
+    const t = canonicalToken(w);
+    if (!t || t.length < 3 || TOKEN_STOPWORDS.has(t)) continue;
+    out.add(t);
+  }
+  return out;
 }
 
 function ingredientsTokenSet(ingredients) {
@@ -70,6 +110,19 @@ function intersectionSize(a, b) {
   let n = 0;
   for (const x of a) if (b.has(x)) n += 1;
   return n;
+}
+
+function topAnchorTokens(...texts) {
+  const counts = new Map();
+  for (const txt of texts) {
+    for (const tok of tokensFromText(txt || "")) {
+      counts.set(tok, (counts.get(tok) || 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([tok]) => tok);
 }
 
 function round1(n) {
@@ -135,6 +188,86 @@ async function fetchIngredientsForMeals(mealIds) {
 }
 
 /**
+ * Lexical anchor retrieval: pull extra candidates that explicitly contain
+ * V1/V2 anchor ingredients (for continuity), then union with vector hits.
+ */
+async function fetchAnchorCandidates({
+  category,
+  anchorTokens = [],
+  excludeIds = [],
+  limit = 40,
+}) {
+  if (!anchorTokens.length) return [];
+  const cleanedExclude = (excludeIds || [])
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n > 0);
+  const { rows } = await query(
+    `WITH matched AS (
+       SELECT DISTINCT m.id, m.title, m.description
+         FROM public.meals m
+         JOIN public.item_meals im ON im.meal_id = m.id
+         JOIN public.items i ON i.id = im.item_id
+        WHERE (
+          $1::text IS NULL
+          OR TRIM($1::text) = ''
+          OR EXISTS (
+            SELECT 1
+              FROM public.meal_category mc
+              JOIN public.categories c ON c.id = mc.category_id
+             WHERE mc.meal_id = m.id
+               AND LOWER(c.title) LIKE '%' || LOWER(TRIM($1::text)) || '%'
+          )
+        )
+          AND EXISTS (
+            SELECT 1
+              FROM UNNEST($2::text[]) AS a
+             WHERE TRIM(a) <> ''
+               AND LOWER(i.title) LIKE '%' || LOWER(TRIM(a)) || '%'
+          )
+          AND (
+            COALESCE(array_length($3::bigint[], 1), 0) = 0
+            OR NOT (m.id = ANY($3::bigint[]))
+          )
+     ),
+     macros AS (
+       SELECT im.meal_id,
+              COALESCE(SUM(im.protein), 0)::numeric AS protein_g,
+              COALESCE(SUM(im.carbs),   0)::numeric AS carb_g,
+              COALESCE(SUM(im.fat),     0)::numeric AS fat_g,
+              COALESCE(SUM(
+                NULLIF(regexp_replace(COALESCE(im.energy, ''), '[^0-9.\\-]+', '', 'g'), '')::numeric
+              ), 0)::numeric AS energy_kj
+         FROM public.item_meals im
+        WHERE im.meal_id IN (SELECT id FROM matched)
+        GROUP BY im.meal_id
+     ),
+     tag_arr AS (
+       SELECT mt.meal_id, ARRAY_AGG(t.name ORDER BY t.name) AS tags
+         FROM public.meal_tag mt
+         JOIN public.tags t ON t.id = mt.tag_id
+        WHERE mt.meal_id IN (SELECT id FROM matched)
+        GROUP BY mt.meal_id
+     )
+     SELECT m.id,
+            m.title,
+            m.description,
+            COALESCE(mc.protein_g, 0)::numeric AS protein_g,
+            COALESCE(mc.carb_g,    0)::numeric AS carb_g,
+            COALESCE(mc.fat_g,     0)::numeric AS fat_g,
+            COALESCE(mc.energy_kj, 0)::numeric AS energy_kj,
+            COALESCE(ta.tags, ARRAY[]::text[]) AS tags,
+            NULL::numeric AS distance
+       FROM matched m
+       LEFT JOIN macros mc ON mc.meal_id = m.id
+       LEFT JOIN tag_arr ta ON ta.meal_id = m.id
+      ORDER BY m.id DESC
+      LIMIT $4`,
+    [category || null, anchorTokens, cleanedExclude, Math.max(1, Number(limit) || 40)],
+  );
+  return rows || [];
+}
+
+/**
  * Run the vector retrieval + re-rank pipeline. Returns
  *   { pool: top10, leftover: rest, queryText, embedded }.
  *
@@ -154,6 +287,7 @@ async function buildCandidatePool({
   vectorK = VECTOR_K,
   poolSize = CLAUDE_POOL_SIZE,
 }) {
+  const anchorTokens = topAnchorTokens(v1MealText, v2MealText);
   const queryText = buildAthleteQueryText({
     slotCategory: category,
     slotLabel: slotLabel && slotLabel !== category ? slotLabel : null,
@@ -170,7 +304,7 @@ async function buildCandidatePool({
 
   let matchedRows = [];
   let embedded = false;
-  if (queryText) {
+  if (queryText && env.openai.apiKey) {
     try {
       const vec = await embedQuery(queryText);
       if (Array.isArray(vec) && vec.length) {
@@ -178,22 +312,56 @@ async function buildCandidatePool({
         // NOTE: empty dislikes array on purpose — Prompt 3 spec says "flag,
         // do NOT exclude". Hard-excluding here would deprive Claude of meals
         // it could otherwise recommend with a substitute.
-        const { rows } = await query(
-          `SELECT * FROM public.match_meals($1::vector, $2, $3::text[], $4, $5::bigint[])`,
-          [
-            formatVectorLiteral(vec),
-            category || null,
-            [], // disliked_foods → empty so they SURFACE for flagging
-            vectorK,
-            (excludeIds || []).map(Number).filter(Number.isFinite),
-          ],
-        );
-        matchedRows = rows || [];
+        const params5 = [
+          formatVectorLiteral(vec),
+          category || null,
+          [], // disliked_foods → empty so they SURFACE for flagging
+          vectorK,
+          (excludeIds || []).map(Number).filter(Number.isFinite),
+        ];
+        try {
+          const { rows } = await query(
+            `SELECT * FROM public.match_meals($1::vector, $2, $3::text[], $4, $5::bigint[])`,
+            params5,
+          );
+          matchedRows = rows || [];
+        } catch (fnErr) {
+          // Backward compatibility for environments that still have the old
+          // 4-argument function (before exclude_ids/distance migration).
+          const msg = String(fnErr?.message || "");
+          if (!/match_meals\(vector, unknown, text\[\], unknown, bigint\[\]\) does not exist/i.test(msg)) {
+            throw fnErr;
+          }
+          const { rows } = await query(
+            `SELECT * FROM public.match_meals($1::vector, $2, $3::text[], $4)`,
+            params5.slice(0, 4),
+          );
+          matchedRows = rows || [];
+          console.warn("[v3Carousel]   ⚠ using legacy 4-arg match_meals (apply latest SQL migration)");
+        }
         console.log(`[v3Carousel]   ✓ match_meals returned ${matchedRows.length} rows`);
       }
     } catch (e) {
       console.error("[v3Carousel]   ✗ match_meals failed:", e.message || e);
     }
+  } else if (queryText && !env.openai.apiKey) {
+    console.warn("[v3Carousel]   ⚠ OPENAI_API_KEY missing — skipping vector retrieval, using lexical continuity retrieval only");
+  }
+
+  const anchorRows = await fetchAnchorCandidates({
+    category,
+    anchorTokens,
+    excludeIds,
+    limit: Math.max(20, Math.floor(vectorK / 2)),
+  });
+  if (anchorRows.length) {
+    const byId = new Map();
+    for (const row of matchedRows) byId.set(Number(row.id), row);
+    for (const row of anchorRows) {
+      const id = Number(row.id);
+      if (!byId.has(id)) byId.set(id, row);
+    }
+    matchedRows = [...byId.values()];
   }
 
   // Hydrate ingredient lists for every matched row up-front so re-ranking
@@ -210,6 +378,11 @@ async function buildCandidatePool({
   );
   const dislikedLc = (dislikedFoods || []).map(lc).filter(Boolean);
 
+  const rankById = new Map(
+    matchedRows.map((r, idx) => [Number(r.id), idx]),
+  );
+  const anchorSet = new Set(anchorTokens);
+
   const scored = matchedRows.map((row) => {
     const mealId = Number(row.id);
     const ingredients = ingredientsByMeal.get(mealId) || [];
@@ -220,8 +393,11 @@ async function buildCandidatePool({
     // synthesise a sim score from rank: top row gets ~1, the row at index
     // (vectorK-1) gets ~0. This matches the formula given in the plan
     // closely enough for re-ranking.
-    const rankIndex = matchedRows.indexOf(row);
-    const simScore = Math.max(0, 1 - rankIndex / Math.max(1, vectorK - 1));
+    const rankIndex = rankById.get(mealId) ?? vectorK;
+    const distance = Number(row.distance);
+    const simScore = Number.isFinite(distance)
+      ? 1 / (1 + Math.max(0, distance))
+      : Math.max(0, 1 - rankIndex / Math.max(1, vectorK - 1));
 
     const overlapScore = Math.min(
       1,
@@ -231,8 +407,14 @@ async function buildCandidatePool({
       1,
       intersectionSize(ingredientTokens, likedTokens) / 3,
     );
+    const anchorScore = anchorSet.size
+      ? Math.min(1, intersectionSize(ingredientTokens, anchorSet) / Math.min(3, anchorSet.size))
+      : 0;
     const finalScore =
-      W_SIM * simScore + W_OVERLAP * overlapScore + W_LIKED * likedScore;
+      W_SIM * simScore +
+      W_OVERLAP * overlapScore +
+      W_LIKED * likedScore +
+      W_ANCHOR * anchorScore;
 
     const { flag: dislikedFlag, substitute: dislikedSubstitute } = detectDisliked(
       ingredients,
@@ -250,16 +432,22 @@ async function buildCandidatePool({
       energy_kcal: kjToKcal(row.energy_kj),
       tags: Array.isArray(row.tags) ? row.tags : [],
       ingredients,
+      distance: Number.isFinite(distance) ? distance : null,
       simScore: round1(simScore * 100) / 100,
       overlapScore: round1(overlapScore * 100) / 100,
       likedScore: round1(likedScore * 100) / 100,
+      anchorScore: round1(anchorScore * 100) / 100,
       finalScore: round1(finalScore * 100) / 100,
       disliked_flag: dislikedFlag,
       disliked_substitute: dislikedSubstitute,
     };
   });
 
-  scored.sort((a, b) => b.finalScore - a.finalScore);
+  scored.sort((a, b) => {
+    if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+    if (b.anchorScore !== a.anchorScore) return b.anchorScore - a.anchorScore;
+    return b.overlapScore - a.overlapScore;
+  });
   const pool = scored.slice(0, poolSize);
   const leftover = scored.slice(poolSize);
 
@@ -274,7 +462,11 @@ async function buildCandidatePool({
     console.log("[v3Carousel]   ⤷ pool is empty — caller should fall back");
   }
 
-  return { pool, leftover, queryText, embedded };
+  if (anchorTokens.length) {
+    console.log("[v3Carousel]   ⤷ anchors:", anchorTokens.join(", "));
+  }
+
+  return { pool, leftover, queryText, embedded, anchorTokens };
 }
 
 /**
@@ -350,6 +542,7 @@ function buildPrompt3({
   v2,
   band,
   pool,
+  coreAnchors = [],
 }) {
   const firstName = athlete.firstName || "Athlete";
   const lastName = athlete.lastName || "";
@@ -383,6 +576,7 @@ function buildPrompt3({
   const slotPHigh = band?.p_high ?? "?";
   const slotCLow = band?.c_low ?? "?";
   const slotCHigh = band?.c_high ?? "?";
+  const anchorsText = coreAnchors.length ? coreAnchors.join(", ") : "(none detected)";
 
   return [
     "You are Virtual Kez. Kerry is selecting Version 3 meals for this athlete's mission slot.",
@@ -396,6 +590,7 @@ function buildPrompt3({
     `MISSION SLOT: ${missionLabel} - ${slotLabel}`,
     `V1 (current meal): ${v1Title} - ${v1Desc}`,
     `V2 (improved attempt): ${v2Title} - ${v2Desc}`,
+    `Core ingredients to preserve when possible: ${anchorsText}`,
     "",
     "MEAL SPLIT TARGET FOR THIS SLOT:",
     `Energy target: ${slotKcalLow}-${slotKcalHigh} kcal (${slotKjLow}-${slotKjHigh} kJ)`,
@@ -438,6 +633,8 @@ function buildPrompt3({
     `- Pick by id only from the VERIFIED MEALS list — do NOT invent meal_ids`,
     "- Same meal category always - never change the type",
     "- Small swaps, not overhauls - find a better version of what they already eat",
+    "- Ingredient continuity is HARD: preserve at least one core ingredient from V1/V2 in each returned meal whenever possible",
+    "- If avocado appears in core ingredients, strongly prioritize avocado-preserving options",
     "- If a meal contains a disliked food: include the meal, set disliked_flag and disliked_substitute",
     "- EER targets are reference only - Kerry edits portions manually",
   ].join("\n");
@@ -558,7 +755,7 @@ function normaliseAiSlot(raw) {
  * (LLM error, malformed JSON, empty meals[]) returns the deterministic
  * top-4 from the pool — never throws to the caller.
  */
-async function runPrompt3({ athlete, prefs, slot, v1, v2, band, pool }) {
+async function runPrompt3({ athlete, prefs, slot, v1, v2, band, pool, coreAnchors = [] }) {
   if (!pool.length) {
     return {
       meals: [],
@@ -569,7 +766,17 @@ async function runPrompt3({ athlete, prefs, slot, v1, v2, band, pool }) {
     };
   }
 
-  const prompt = buildPrompt3({ athlete, prefs, slot, v1, v2, band, pool });
+  // In some environments (local demos / CI snapshots) LLM keys are intentionally
+  // absent. Treat this as deterministic mode, not a hard error.
+  if (!hasLlmApiKey()) {
+    return {
+      ...buildFallbackResponse({ pool, v1, v2, slot, prefs }),
+      source: "deterministic_no_llm",
+      raw: null,
+    };
+  }
+
+  const prompt = buildPrompt3({ athlete, prefs, slot, v1, v2, band, pool, coreAnchors });
   console.log("[v3Carousel] 📝 Prompt 3 length =", prompt.length, "chars");
 
   let raw = "";
@@ -667,6 +874,7 @@ module.exports = {
   W_SIM,
   W_OVERLAP,
   W_LIKED,
+  W_ANCHOR,
   VECTOR_K,
   CLAUDE_POOL_SIZE,
   FINAL_PICK_COUNT,
